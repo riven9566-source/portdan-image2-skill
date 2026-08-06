@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -121,6 +122,18 @@ class GenerateImageTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(self.resolve(home), KEY)
 
+    def test_named_portdan_cc_switch_provider_uses_auth_before_parsing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database(
+                home,
+                "this provider config does not need to be parsed",
+                {"OPENAI_API_KEY": KEY},
+            )
+            with patch.object(generate_image, "_parse_config") as parse:
+                self.assertEqual(self.resolve(home), KEY)
+            parse.assert_not_called()
+
     def test_non_portdan_current_cc_switch_key_is_not_sent_to_portdan(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -182,6 +195,44 @@ class GenerateImageTests(unittest.TestCase):
                 home / ".codex",
                 '[model_providers.portdan]\n'
                 'experimental_bearer_token = "{}"\n'.format(KEY),
+            )
+            self.assertEqual(self.resolve(home), KEY)
+
+    def test_inline_portdan_token_does_not_read_auth_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_config(
+                home / ".codex",
+                '[model_providers.portdan]\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
+                {"OPENAI_API_KEY": OTHER_KEY},
+            )
+            with patch.object(generate_image, "_read_auth") as read_auth:
+                self.assertEqual(self.resolve(home), KEY)
+            read_auth.assert_not_called()
+
+    def test_active_provider_auth_precedes_backup_inline_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_config(
+                home / ".codex",
+                'model_provider = "portdan"\n'
+                '[model_providers.portdan]\nrequires_openai_auth = true\n'
+                '[model_providers.portdan_backup]\n'
+                'experimental_bearer_token = "{}"\n'.format(OTHER_KEY),
+                {"OPENAI_API_KEY": KEY},
+            )
+            self.assertEqual(self.resolve(home), KEY)
+
+    def test_top_level_portdan_auth_precedes_backup_inline_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_config(
+                home / ".codex",
+                'openai_base_url = "https://portdan.com"\n'
+                '[model_providers.portdan_backup]\n'
+                'experimental_bearer_token = "{}"\n'.format(OTHER_KEY),
+                {"OPENAI_API_KEY": KEY},
             )
             self.assertEqual(self.resolve(home), KEY)
 
@@ -264,7 +315,13 @@ class GenerateImageTests(unittest.TestCase):
             home.mkdir()
             installed = root / "installed codex"
             installed.mkdir()
-            script = installed / "skills" / "portdan-image2" / "scripts" / "generate_image.py"
+            script = (
+                installed
+                / "skills"
+                / "portdan-image2"
+                / "scripts"
+                / "generate_image.py"
+            )
             self.write_config(
                 installed,
                 '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
@@ -280,6 +337,46 @@ class GenerateImageTests(unittest.TestCase):
                 self.assertEqual(
                     self.resolve(home, {"CODEX_HOME": str(code_home)}), KEY
                 )
+
+    def test_installed_skill_key_stops_before_custom_directory_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            installed = root / "installed codex"
+            installed.mkdir()
+            script = installed / "skills" / "portdan-image2" / "scripts" / "generate_image.py"
+            self.write_config(
+                installed,
+                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
+            )
+            with patch.object(generate_image, "__file__", str(script)), patch.object(
+                generate_image, "_custom_codex_root"
+            ) as custom:
+                self.assertEqual(self.resolve(home), KEY)
+            custom.assert_not_called()
+
+    def test_short_cc_switch_write_lock_keeps_current_provider_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database(
+                home,
+                'openai_base_url = "https://portdan.com"\n',
+                {"OPENAI_API_KEY": KEY},
+            )
+            database = home / ".cc-switch" / "cc-switch.db"
+            locker = sqlite3.connect(database, check_same_thread=False)
+            locker.execute("PRAGMA journal_mode=DELETE")
+            locker.execute("BEGIN EXCLUSIVE")
+            release = threading.Timer(0.05, locker.rollback)
+            release.start()
+            try:
+                self.assertEqual(
+                    self.resolve(home, {"PORTDAN_API_KEY": OTHER_KEY}), KEY
+                )
+            finally:
+                release.join()
+                locker.close()
 
     def test_cc_switch_custom_directory_precedes_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

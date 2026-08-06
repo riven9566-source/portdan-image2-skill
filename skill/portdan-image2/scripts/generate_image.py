@@ -16,7 +16,7 @@ import sys
 import time
 import zlib
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -41,6 +41,7 @@ MAX_PROMPT_BYTES = 80_000
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_PIXELS = 4_000_000
+CC_SWITCH_DB_TIMEOUT_SECONDS = 0.2
 
 
 class ConfigError(RuntimeError):
@@ -309,8 +310,20 @@ def _config_auth_allowed(config: Dict[str, Any], providers: list[tuple[str, Dict
     return len(providers) == 1 and _provider_is_portdan(*providers[0])
 
 
+def _key_from_provider(
+    provider: Dict[str, Any], environ: Mapping[str, str]
+) -> Optional[str]:
+    inline = _maybe_key(provider.get("experimental_bearer_token"))
+    if inline:
+        return inline
+    env_name = provider.get("env_key")
+    if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+        return _maybe_key(environ.get(env_name))
+    return None
+
+
 def _key_from_config(
-    config: Dict[str, Any], auth: Any, environ: Dict[str, str]
+    config: Dict[str, Any], auth: Any, environ: Mapping[str, str]
 ) -> Optional[str]:
     providers = _configured_providers(config)
     active = config.get("model_provider")
@@ -324,14 +337,9 @@ def _key_from_config(
     )
     if active_provider is not None:
         _, provider = active_provider
-        inline = _maybe_key(provider.get("experimental_bearer_token"))
-        if inline:
-            return inline
-        env_name = provider.get("env_key")
-        if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
-            env_value = _maybe_key(environ.get(env_name))
-            if env_value:
-                return env_value
+        direct = _key_from_provider(provider, environ)
+        if direct:
+            return direct
         auth_key = _auth_key(auth)
         if auth_key:
             return auth_key
@@ -348,14 +356,9 @@ def _key_from_config(
         if _provider_is_portdan(name, provider)
     ]
     for _, provider in portdan_providers:
-        inline = _maybe_key(provider.get("experimental_bearer_token"))
-        if inline:
-            candidates.add(inline)
-        env_name = provider.get("env_key")
-        if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
-            env_value = _maybe_key(environ.get(env_name))
-            if env_value:
-                candidates.add(env_value)
+        direct = _key_from_provider(provider, environ)
+        if direct:
+            candidates.add(direct)
     if len(candidates) == 1:
         return next(iter(candidates))
     if len(providers) == 1 and len(portdan_providers) == 1:
@@ -371,24 +374,49 @@ def _read_auth(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _key_from_config_root(root: Path, environ: Dict[str, str]) -> Optional[str]:
+def _key_from_config_root(root: Path, environ: Mapping[str, str]) -> Optional[str]:
     try:
         config = _parse_config(_read_small_file(root / "config.toml", MAX_CONFIG_BYTES))
     except ConfigError:
         return None
     providers = _configured_providers(config)
+    active = config.get("model_provider")
+    active_provider = next(
+        (
+            provider
+            for name, provider in providers
+            if isinstance(active, str)
+            and name == active
+            and _provider_is_portdan(name, provider)
+        ),
+        None,
+    )
+    if active_provider is not None:
+        direct = _key_from_provider(active_provider, environ)
+        if direct:
+            return direct
+    elif not _top_level_portdan_applies(config, providers) and len(providers) == 1:
+        name, provider = providers[0]
+        if _provider_is_portdan(name, provider):
+            direct = _key_from_provider(provider, environ)
+            if direct:
+                return direct
     auth = _read_auth(root / "auth.json") if _config_auth_allowed(config, providers) else None
     return _key_from_config(config, auth, environ)
 
 
-def _key_from_cc_switch_database(home: Path, environ: Dict[str, str]) -> Optional[str]:
+def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Optional[str]:
     database = home / ".cc-switch" / "cc-switch.db"
     try:
         resolved = database.resolve(strict=True)
         info = resolved.stat()
         if not stat.S_ISREG(info.st_mode):
             return None
-        connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+        connection = sqlite3.connect(
+            resolved.as_uri() + "?mode=ro",
+            uri=True,
+            timeout=CC_SWITCH_DB_TIMEOUT_SECONDS,
+        )
     except (OSError, sqlite3.Error, ValueError):
         return None
     try:
@@ -421,6 +449,10 @@ def _key_from_cc_switch_database(home: Path, environ: Dict[str, str]) -> Optiona
             isinstance(identity.get("name"), str)
             and "portdan" in identity["name"].casefold()
         ) or _is_portdan_url(identity.get("website_url"))
+        if identity_is_portdan:
+            key = _auth_key(settings.get("auth"))
+            if key:
+                return key
         config_text = settings.get("config")
         config: Optional[Dict[str, Any]] = None
         if isinstance(config_text, str):
@@ -428,9 +460,8 @@ def _key_from_cc_switch_database(home: Path, environ: Dict[str, str]) -> Optiona
                 config = _parse_config(config_text.encode("utf-8"))
             except (ConfigError, UnicodeEncodeError):
                 config = None
-        if identity_is_portdan or (
-            config is not None
-            and _config_auth_allowed(config, _configured_providers(config))
+        if config is not None and _config_auth_allowed(
+            config, _configured_providers(config)
         ):
             key = _auth_key(settings.get("auth"))
             if key:
@@ -455,33 +486,44 @@ def _custom_codex_root(home: Path) -> Optional[Path]:
     return _existing_directory(Path(custom.strip()).expanduser())
 
 
-def _candidate_config_roots(home: Path, environ: Dict[str, str]) -> list[Path]:
-    candidates: list[Path] = []
+def _candidate_config_roots(
+    home: Path, environ: Mapping[str, str]
+) -> Iterator[Path]:
+    seen: set[str] = set()
+
+    def resolve(candidate: Path) -> Optional[Path]:
+        resolved = _existing_directory(candidate)
+        identity = str(resolved) if resolved is not None else ""
+        if resolved is None or identity in seen:
+            return None
+        seen.add(identity)
+        return resolved
+
     script = Path(__file__).resolve()
     if len(script.parents) > 3 and script.parents[2].name == "skills":
-        candidates.append(script.parents[3])
+        installed = resolve(script.parents[3])
+        if installed is not None:
+            yield installed
+
     codex_home = environ.get("CODEX_HOME")
     if codex_home:
-        candidates.append(Path(codex_home).expanduser())
-    custom = _custom_codex_root(home)
-    if custom is not None:
-        candidates.append(custom)
-    candidates.append(home / ".codex")
+        configured = resolve(Path(codex_home).expanduser())
+        if configured is not None:
+            yield configured
 
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        resolved = _existing_directory(candidate)
-        if resolved is None or str(resolved) in seen:
-            continue
-        seen.add(str(resolved))
-        unique.append(resolved)
-    return unique
+    custom = _custom_codex_root(home)
+    if custom is not None and str(custom) not in seen:
+        seen.add(str(custom))
+        yield custom
+
+    default = resolve(home / ".codex")
+    if default is not None:
+        yield default
 
 
 def resolve_api_key() -> str:
     home = Path.home()
-    environ = dict(os.environ)
+    environ = os.environ
     key = _key_from_cc_switch_database(home, environ)
     if key:
         return key
