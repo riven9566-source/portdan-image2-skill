@@ -1,0 +1,7 @@
+interface:
+  display_name: "Portdan Image2"
+  short_description: "读取当前 CC Switch 配置并用 Portdan gpt-image-2 生图"
+  default_prompt: "使用 $portdan-image2 生成一张图片，不要调用账号生图。"
+
+policy:
+  allow_implicit_invocation: true

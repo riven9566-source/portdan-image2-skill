@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+*.skill
+build/
+*.egg-info/
+portdan-images/
+private-prompts/
+.codex/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
