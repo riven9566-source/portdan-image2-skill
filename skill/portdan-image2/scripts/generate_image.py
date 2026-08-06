@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one PNG through the active Portdan Responses provider."""
+"""Generate one PNG with OpenAI gpt-image-2 through the Portdan Images API."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import stat
 import sys
 import time
 import zlib
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -28,10 +28,12 @@ except ModuleNotFoundError:  # Python 3.9/3.10
 
 
 HOST = "portdan.com"
-ENDPOINT = "https://portdan.com/v1/responses"
+ENDPOINT = "https://portdan.com/v1/images/generations"
 IMAGE_MODEL = "gpt-image-2"
-MISSING_KEY_MESSAGE = "请配置好 Portdan 后台的 API 密钥"
+MISSING_KEY_MESSAGE = "未找到 Portdan API Key，请先在 CC Switch 中选择 Portdan，或设置 PORTDAN_API_KEY"
 SIZES = ("1024x1024", "1536x1024", "1024x1536")
+QUALITIES = ("low", "medium", "high")
+QUALITY_LABELS = {"low": "快速", "medium": "均衡", "high": "高清"}
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_SETTINGS_BYTES = 512 * 1024
 MAX_PROMPT_CHARS = 20_000
@@ -61,12 +63,6 @@ class OutputRecoveryError(RuntimeError):
         super().__init__(str(path))
 
 
-@dataclass(frozen=True)
-class Provider:
-    model: str
-    api_key: str = field(repr=False)
-
-
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
         return None
@@ -79,68 +75,32 @@ def _is_link_like(info: os.stat_result) -> bool:
     )
 
 
-def _read_regular(path: Path, limit: int) -> bytes:
-    descriptor = -1
+def _read_small_file(path: Path, limit: int) -> bytes:
     try:
-        info = path.lstat()
+        resolved = path.expanduser().resolve(strict=True)
+        info = resolved.stat()
     except OSError as exc:
         raise ConfigError() from exc
-    if _is_link_like(info) or not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
         raise ConfigError()
     try:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(str(path), flags)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_size > limit:
-            raise ConfigError()
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = -1
+        with resolved.open("rb") as handle:
             data = handle.read(limit + 1)
     except OSError as exc:
         raise ConfigError() from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
     if len(data) > limit:
         raise ConfigError()
     return data
 
 
-def _directory(path: Path) -> Path:
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise ConfigError() from exc
-    if _is_link_like(info) or not stat.S_ISDIR(info.st_mode):
-        raise ConfigError()
+def _existing_directory(path: Path) -> Optional[Path]:
     try:
         resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise ConfigError() from exc
-    if resolved == Path(resolved.anchor):
-        raise ConfigError()
+        if not resolved.is_dir() or resolved == Path(resolved.anchor):
+            return None
+    except OSError:
+        return None
     return resolved
-
-
-def _config_root() -> Path:
-    home = Path.home()
-    settings_path = home / ".cc-switch" / "settings.json"
-    if settings_path.exists() or settings_path.is_symlink():
-        try:
-            settings = json.loads(_read_regular(settings_path, MAX_SETTINGS_BYTES).decode("utf-8-sig"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ConfigError() from exc
-        if not isinstance(settings, dict):
-            raise ConfigError()
-        custom = settings.get("codexConfigDir")
-        if custom is not None:
-            if not isinstance(custom, str) or not custom.strip():
-                raise ConfigError()
-            custom_path = Path(custom.strip()).expanduser()
-            if not custom_path.is_absolute():
-                raise ConfigError()
-            return _directory(custom_path)
-    return _directory(home / ".codex")
 
 
 def _strip_comment(line: str) -> str:
@@ -205,13 +165,23 @@ def _fallback_toml(text: str) -> Dict[str, Any]:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
             continue
         value = _toml_value(raw)
-        dotted = re.fullmatch(r"model_providers\.([A-Za-z0-9_-]+)\.(base_url|wire_api|experimental_bearer_token)", key)
+        dotted = re.fullmatch(
+            r"model_providers\.([A-Za-z0-9_-]+)\."
+            r"(base_url|wire_api|experimental_bearer_token|env_key|requires_openai_auth)",
+            key,
+        )
         if dotted:
             providers.setdefault(dotted.group(1), {})[dotted.group(2)] = value
         elif current is None:
-            if key in ("model", "model_provider"):
+            if key in ("model", "model_provider", "openai_base_url"):
                 top[key] = value
-        elif key in ("base_url", "wire_api", "experimental_bearer_token"):
+        elif key in (
+            "base_url",
+            "wire_api",
+            "experimental_bearer_token",
+            "env_key",
+            "requires_openai_auth",
+        ):
             providers[current][key] = value
     top["model_providers"] = providers
     return top
@@ -234,15 +204,15 @@ def _parse_config(raw: bytes) -> Dict[str, Any]:
     return value
 
 
-def _endpoint(base_url: Any) -> str:
+def _is_portdan_url(base_url: Any) -> bool:
     if not isinstance(base_url, str):
-        raise ConfigError()
+        return False
     try:
         parsed = urlsplit(base_url.strip())
         port = parsed.port
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ConfigError() from exc
-    if (
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return not (
         parsed.scheme.lower() != "https"
         or (parsed.hostname or "").lower() != HOST
         or parsed.username
@@ -250,10 +220,8 @@ def _endpoint(base_url: Any) -> str:
         or port not in (None, 443)
         or parsed.query
         or parsed.fragment
-        or parsed.path.rstrip("/") not in ("", "/v1")
-    ):
-        raise ConfigError()
-    return ENDPOINT
+        or parsed.path.rstrip("/") not in ("", "/v1", "/backend-api/codex")
+    )
 
 
 def _key(value: Any) -> str:
@@ -267,55 +235,290 @@ def _key(value: Any) -> str:
     return result
 
 
-def resolve_provider() -> Provider:
-    root = _config_root()
-    config = _parse_config(_read_regular(root / "config.toml", MAX_CONFIG_BYTES))
+def _maybe_key(value: Any) -> Optional[str]:
+    try:
+        return _key(value)
+    except ConfigError:
+        return None
+
+
+def _json_object(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _auth_key(auth: Any) -> Optional[str]:
+    payload = _json_object(auth)
+    if payload is None:
+        return None
+    return _maybe_key(payload.get("OPENAI_API_KEY"))
+
+
+def _configured_providers(config: Dict[str, Any]) -> list[tuple[str, Dict[str, Any]]]:
     active = config.get("model_provider")
     providers = config.get("model_providers")
-    if not isinstance(active, str) or not isinstance(providers, dict):
-        raise ConfigError()
-    provider = providers.get(active)
-    if not isinstance(provider, dict):
-        raise ConfigError()
-    if provider.get("wire_api") != "responses":
-        raise ConfigError()
-    _endpoint(provider.get("base_url"))
-    model = config.get("model")
-    if not isinstance(model, str) or not model.strip():
-        raise ConfigError()
-    if "experimental_bearer_token" in provider:
-        return Provider(model=model.strip(), api_key=_key(provider.get("experimental_bearer_token")))
+    if not isinstance(providers, dict):
+        return []
+    names = list(providers)
+    if isinstance(active, str) and active in providers:
+        names.remove(active)
+        names.insert(0, active)
+    result: list[tuple[str, Dict[str, Any]]] = []
+    for name in names:
+        provider = providers.get(name)
+        if isinstance(provider, dict):
+            result.append((name, provider))
+    return result
+
+
+def _provider_is_portdan(name: str, provider: Dict[str, Any]) -> bool:
+    return "portdan" in name.casefold() or _is_portdan_url(provider.get("base_url"))
+
+
+def _top_level_portdan_applies(
+    config: Dict[str, Any], providers: list[tuple[str, Dict[str, Any]]]
+) -> bool:
+    if not _is_portdan_url(config.get("openai_base_url")):
+        return False
+    active = config.get("model_provider")
+    if not isinstance(active, str):
+        return True
+    active_provider = next(
+        ((name, provider) for name, provider in providers if name == active), None
+    )
+    return active_provider is None or _provider_is_portdan(*active_provider)
+
+
+def _config_auth_allowed(config: Dict[str, Any], providers: list[tuple[str, Dict[str, Any]]]) -> bool:
+    if _top_level_portdan_applies(config, providers):
+        return True
+    active = config.get("model_provider")
+    if isinstance(active, str):
+        active_provider = next(
+            ((name, provider) for name, provider in providers if name == active), None
+        )
+        if active_provider is not None and _provider_is_portdan(*active_provider):
+            return True
+    return len(providers) == 1 and _provider_is_portdan(*providers[0])
+
+
+def _key_from_config(
+    config: Dict[str, Any], auth: Any, environ: Dict[str, str]
+) -> Optional[str]:
+    providers = _configured_providers(config)
+    active = config.get("model_provider")
+    active_provider = next(
+        (
+            (name, provider)
+            for name, provider in providers
+            if isinstance(active, str) and name == active and _provider_is_portdan(name, provider)
+        ),
+        None,
+    )
+    if active_provider is not None:
+        _, provider = active_provider
+        inline = _maybe_key(provider.get("experimental_bearer_token"))
+        if inline:
+            return inline
+        env_name = provider.get("env_key")
+        if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+            env_value = _maybe_key(environ.get(env_name))
+            if env_value:
+                return env_value
+        auth_key = _auth_key(auth)
+        if auth_key:
+            return auth_key
+
+    if _top_level_portdan_applies(config, providers):
+        auth_key = _auth_key(auth)
+        if auth_key:
+            return auth_key
+
+    candidates: set[str] = set()
+    portdan_providers = [
+        (name, provider)
+        for name, provider in providers
+        if _provider_is_portdan(name, provider)
+    ]
+    for _, provider in portdan_providers:
+        inline = _maybe_key(provider.get("experimental_bearer_token"))
+        if inline:
+            candidates.add(inline)
+        env_name = provider.get("env_key")
+        if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
+            env_value = _maybe_key(environ.get(env_name))
+            if env_value:
+                candidates.add(env_value)
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if len(providers) == 1 and len(portdan_providers) == 1:
+        return _auth_key(auth)
+    return None
+
+
+def _read_auth(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _read_small_file(path, MAX_SETTINGS_BYTES)
+        return _json_object(raw.decode("utf-8-sig"))
+    except (ConfigError, UnicodeDecodeError):
+        return None
+
+
+def _key_from_config_root(root: Path, environ: Dict[str, str]) -> Optional[str]:
+    try:
+        config = _parse_config(_read_small_file(root / "config.toml", MAX_CONFIG_BYTES))
+    except ConfigError:
+        return None
+    providers = _configured_providers(config)
+    auth = _read_auth(root / "auth.json") if _config_auth_allowed(config, providers) else None
+    return _key_from_config(config, auth, environ)
+
+
+def _key_from_cc_switch_database(home: Path, environ: Dict[str, str]) -> Optional[str]:
+    database = home / ".cc-switch" / "cc-switch.db"
+    try:
+        resolved = database.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True, timeout=0.25)
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(providers)").fetchall()
+            if len(row) > 1
+        }
+        if not {"settings_config", "app_type", "is_current"}.issubset(columns):
+            return None
+        identity_columns = [
+            name for name in ("name", "website_url", "provider_type") if name in columns
+        ]
+        selected = ", ".join(["settings_config"] + identity_columns)
+        rows = connection.execute(
+            "SELECT " + selected + " FROM providers "
+            "WHERE app_type = 'codex' AND is_current = 1 ORDER BY rowid DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    for row in rows:
+        settings = _json_object(row[0] if row else None)
+        if settings is None:
+            continue
+        identity = dict(zip(identity_columns, row[1:]))
+        identity_is_portdan = (
+            isinstance(identity.get("name"), str)
+            and "portdan" in identity["name"].casefold()
+        ) or _is_portdan_url(identity.get("website_url"))
+        config_text = settings.get("config")
+        config: Optional[Dict[str, Any]] = None
+        if isinstance(config_text, str):
+            try:
+                config = _parse_config(config_text.encode("utf-8"))
+            except (ConfigError, UnicodeEncodeError):
+                config = None
+        if identity_is_portdan or (
+            config is not None
+            and _config_auth_allowed(config, _configured_providers(config))
+        ):
+            key = _auth_key(settings.get("auth"))
+            if key:
+                return key
+        if config is not None:
+            key = _key_from_config(config, None, environ)
+            if key:
+                return key
+    return None
+
+
+def _custom_codex_root(home: Path) -> Optional[Path]:
+    try:
+        settings = _json_object(
+            _read_small_file(home / ".cc-switch" / "settings.json", MAX_SETTINGS_BYTES).decode("utf-8-sig")
+        )
+    except (ConfigError, UnicodeDecodeError):
+        return None
+    custom = settings.get("codexConfigDir") if settings else None
+    if not isinstance(custom, str) or not custom.strip():
+        return None
+    return _existing_directory(Path(custom.strip()).expanduser())
+
+
+def _candidate_config_roots(home: Path, environ: Dict[str, str]) -> list[Path]:
+    candidates: list[Path] = []
+    script = Path(__file__).resolve()
+    if len(script.parents) > 3 and script.parents[2].name == "skills":
+        candidates.append(script.parents[3])
+    codex_home = environ.get("CODEX_HOME")
+    if codex_home:
+        candidates.append(Path(codex_home).expanduser())
+    custom = _custom_codex_root(home)
+    if custom is not None:
+        candidates.append(custom)
+    candidates.append(home / ".codex")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = _existing_directory(candidate)
+        if resolved is None or str(resolved) in seen:
+            continue
+        seen.add(str(resolved))
+        unique.append(resolved)
+    return unique
+
+
+def resolve_api_key() -> str:
+    home = Path.home()
+    environ = dict(os.environ)
+    key = _key_from_cc_switch_database(home, environ)
+    if key:
+        return key
+    for root in _candidate_config_roots(home, environ):
+        key = _key_from_config_root(root, environ)
+        if key:
+            return key
+    key = _maybe_key(environ.get("PORTDAN_API_KEY"))
+    if key:
+        return key
     raise ConfigError()
 
 
-def _payload(provider: Provider, prompt: str, size: str) -> bytes:
+def _payload(prompt: str, size: str, quality: str) -> bytes:
     body = {
-        "model": provider.model,
-        "input": prompt,
-        "tools": [{
-            "type": "image_generation",
-            "action": "generate",
-            "model": IMAGE_MODEL,
-            "size": size,
-            "output_format": "png",
-        }],
-        "tool_choice": {"type": "image_generation"},
-        "store": False,
+        "model": IMAGE_MODEL,
+        "prompt": prompt,
+        "n": 1,
+        "size": size,
+        "quality": quality,
+        "response_format": "b64_json",
+        "output_format": "png",
         "stream": False,
     }
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _post(provider: Provider, body: bytes, timeout: float) -> bytes:
+def _post(api_key: str, body: bytes, timeout: float) -> bytes:
     request = Request(
         ENDPOINT,
         data=body,
         method="POST",
         headers={
-            "Authorization": "Bearer " + provider.api_key,
+            "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "portdan-image2-skill/2.0",
+            "User-Agent": "portdan-image2-skill/3.0",
         },
     )
     opener = build_opener(ProxyHandler({}), _NoRedirect())
@@ -337,13 +540,15 @@ def _image_bytes(raw: bytes) -> bytes:
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ResponseError() from exc
-    output = response.get("output") if isinstance(response, dict) else None
-    if not isinstance(output, list):
+    output = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
         raise ResponseError()
-    calls = [item for item in output if isinstance(item, dict) and item.get("type") == "image_generation_call"]
-    if len(calls) != 1 or not isinstance(calls[0].get("result"), str):
+    value = output[0].get("b64_json")
+    if not isinstance(value, str):
+        url = output[0].get("url")
+        value = url if isinstance(url, str) and url.lower().startswith("data:image/") else None
+    if not isinstance(value, str):
         raise ResponseError()
-    value = calls[0]["result"]
     if value.startswith("data:") and "," in value:
         value = value.split(",", 1)[1]
     try:
@@ -533,18 +738,21 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate one Portdan gpt-image-2 PNG")
     parser.add_argument("--prompt-stdin", action="store_true", help="read the visual prompt from standard input")
     parser.add_argument("--size", choices=SIZES, default="1024x1024")
+    parser.add_argument("--quality", choices=QUALITIES, default="medium")
     parser.add_argument("--timeout", type=float, default=300.0)
     return parser
 
 
 def _error_message(error: RequestError) -> str:
     if error.status in (401, 403):
-        return "Portdan API Key 无效或没有图片权限"
+        return "Portdan API Key 无效，或当前分组未开放 gpt-image-2"
     if error.status == 429:
         return "Portdan 当前限流，请稍后再试"
+    if error.status == 404:
+        return "Portdan 当前未找到可用的 gpt-image-2 图片通道"
     if error.status == 0 or error.status >= 500:
         return "Portdan 请求失败；请求可能已经到达后台，请先检查 Portdan 记录后再决定是否重试"
-    return "Portdan 拒绝了图片请求，请检查当前模型和请求配置"
+    return "Portdan 拒绝了图片请求，请检查当前分组是否支持 gpt-image-2"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -553,12 +761,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("图片提示词或超时时间无效", file=sys.stderr)
         return 2
     try:
+        started = time.monotonic()
         prompt = _prompt_from_stdin()
-        provider = resolve_provider()
-        body = _payload(provider, prompt, args.size)
-        raw = _post(provider, body, min(args.timeout, 900.0))
+        api_key = resolve_api_key()
+        body = _payload(prompt, args.size, args.quality)
+        print(
+            "正在通过 Portdan 调用 OpenAI gpt-image-2（{}）生成图片…".format(
+                QUALITY_LABELS[args.quality]
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        raw = _post(api_key, body, min(args.timeout, 900.0))
         image = _image_bytes(raw)
-        print(_save_png(image).absolute())
+        output = _save_png(image).absolute()
+        print(output)
+        print(
+            "已通过 Portdan 调用 OpenAI gpt-image-2 生成，耗时 {:.1f} 秒".format(
+                time.monotonic() - started
+            ),
+            file=sys.stderr,
+        )
         return 0
     except ConfigError:
         print(MISSING_KEY_MESSAGE, file=sys.stderr)
