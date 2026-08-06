@@ -14,6 +14,11 @@ from skill_manifest import SKILL_FILES, SKILL_NAME, _is_link_like, read_regular_
 SKILL_ROOT = ROOT / "skill" / SKILL_NAME
 
 
+def _is_python_cache(path: Path) -> bool:
+    relative = path.relative_to(SKILL_ROOT)
+    return "__pycache__" in relative.parts or path.suffix in (".pyc", ".pyo")
+
+
 def main() -> int:
     if not SKILL_ROOT.is_dir() or SKILL_ROOT.is_symlink():
         raise RuntimeError("Skill directory is invalid")
@@ -24,7 +29,7 @@ def main() -> int:
     actual = {
         str(path.relative_to(SKILL_ROOT)).replace("\\", "/")
         for path in entries
-        if path.is_file()
+        if path.is_file() and not _is_python_cache(path)
     }
     if actual != expected:
         raise RuntimeError("Skill file allowlist mismatch")

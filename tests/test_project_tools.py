@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -77,6 +79,26 @@ class ProjectToolTests(unittest.TestCase):
                 self.skipTest("symlink creation is unavailable: {}".format(exc))
             with self.assertRaises(RuntimeError):
                 skill_manifest.read_regular_file(link)
+
+    def test_validator_ignores_python_cache_files(self) -> None:
+        cache = ROOT / "skill" / "portdan-image2" / "scripts" / "__pycache__"
+        cache.mkdir(exist_ok=True)
+        marker = cache / "validator-test.pyc"
+        marker.write_bytes(b"interpreter cache")
+        try:
+            completed = subprocess.run(
+                [sys.executable, str(ROOT / "tools" / "validate_skill.py")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", "replace"))
+        finally:
+            marker.unlink(missing_ok=True)
+            try:
+                cache.rmdir()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
