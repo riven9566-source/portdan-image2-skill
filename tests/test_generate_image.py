@@ -26,14 +26,16 @@ PNG = base64.b64decode(
 )
 KEY = "portdan-test-key-123456"
 OTHER_KEY = "portdan-other-key-654321"
+MODEL = "gpt-5.6-sol"
 
 
 def response_body() -> bytes:
     return json.dumps({
-        "created": 1,
-        "data": [{
-            "b64_json": base64.b64encode(PNG).decode("ascii"),
-            "revised_prompt": "a dog",
+        "status": "completed",
+        "output": [{
+            "type": "image_generation_call",
+            "status": "completed",
+            "result": base64.b64encode(PNG).decode("ascii"),
         }],
     }).encode()
 
@@ -82,12 +84,20 @@ class GenerateImageTests(unittest.TestCase):
         ):
             return generate_image.resolve_api_key()
 
+    def resolve_request(
+        self, home: Path, env: dict[str, str] | None = None
+    ) -> generate_image.RequestConfig:
+        with patch.object(Path, "home", return_value=home), patch.dict(
+            os.environ, env or {}, clear=True
+        ):
+            return generate_image.resolve_request_config()
+
     def test_cc_switch_current_codex_provider_is_first_key_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_cc_database(
                 home,
-                'openai_base_url = "https://portdan.com"\n',
+                'model = "{}"\nopenai_base_url = "https://portdan.com"\n'.format(MODEL),
                 {"auth_mode": "apikey", "OPENAI_API_KEY": KEY},
             )
             self.write_config(
@@ -96,6 +106,10 @@ class GenerateImageTests(unittest.TestCase):
                 'experimental_bearer_token = "{}"\n'.format(OTHER_KEY),
             )
             self.assertEqual(self.resolve(home, {"PORTDAN_API_KEY": OTHER_KEY}), KEY)
+            self.assertEqual(
+                self.resolve_request(home, {"PORTDAN_API_KEY": OTHER_KEY}).model,
+                MODEL,
+            )
 
     def test_cc_switch_current_provider_needs_only_its_auth_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -122,7 +136,7 @@ class GenerateImageTests(unittest.TestCase):
                 connection.close()
             self.assertEqual(self.resolve(home), KEY)
 
-    def test_named_portdan_cc_switch_provider_uses_auth_before_parsing_config(self) -> None:
+    def test_named_portdan_cc_switch_provider_uses_auth_when_config_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_cc_database(
@@ -130,9 +144,9 @@ class GenerateImageTests(unittest.TestCase):
                 "this provider config does not need to be parsed",
                 {"OPENAI_API_KEY": KEY},
             )
-            with patch.object(generate_image, "_parse_config") as parse:
-                self.assertEqual(self.resolve(home), KEY)
-            parse.assert_not_called()
+            request_config = self.resolve_request(home)
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(request_config.model, generate_image.DEFAULT_RESPONSE_MODEL)
 
     def test_non_portdan_current_cc_switch_key_is_not_sent_to_portdan(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -165,6 +179,24 @@ class GenerateImageTests(unittest.TestCase):
                 {},
             )
             self.assertEqual(self.resolve(home), KEY)
+            self.assertEqual(
+                self.resolve_request(home).model, generate_image.DEFAULT_RESPONSE_MODEL
+            )
+
+    def test_known_incompatible_outer_models_use_safe_fallback(self) -> None:
+        for model in (
+            "gpt-image-2",
+            "openai/gpt-image-2",
+            "gpt-5.3-codex-spark",
+            "gpt-5.3-codex-spark-high",
+            "gpt5.3codexspark",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    generate_image._configured_model({"model": model}),
+                    generate_image.DEFAULT_RESPONSE_MODEL,
+                )
+        self.assertEqual(generate_image._configured_model({"model": MODEL}), MODEL)
 
     def test_cc_switch_database_config_env_key_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -241,10 +273,11 @@ class GenerateImageTests(unittest.TestCase):
             home = Path(temp)
             self.write_config(
                 home / ".codex",
-                'openai_base_url = "https://portdan.com"\n',
+                'model = "{}"\nopenai_base_url = "https://portdan.com"\n'.format(MODEL),
                 {"auth_mode": "apikey", "OPENAI_API_KEY": KEY, "tokens": {"access_token": "ignored"}},
             )
             self.assertEqual(self.resolve(home), KEY)
+            self.assertEqual(self.resolve_request(home).model, MODEL)
 
     def test_requires_openai_auth_provider_uses_auth_json_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -280,6 +313,24 @@ class GenerateImageTests(unittest.TestCase):
                 'experimental_bearer_token = "{}"\n'.format(OTHER_KEY),
             )
             self.assertEqual(self.resolve(home, {"PORTDAN_API_KEY": KEY}), KEY)
+
+    def test_backup_portdan_key_does_not_inherit_active_foreign_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_config(
+                home / ".codex",
+                'model = "foreign-provider-only-model"\n'
+                'model_provider = "foreign"\n'
+                '[model_providers.foreign]\n'
+                'base_url = "https://api.example.com/v1"\n'
+                '[model_providers.portdan_backup]\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
+            )
+            request_config = self.resolve_request(home)
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(
+                request_config.model, generate_image.DEFAULT_RESPONSE_MODEL
+            )
 
     def test_provider_env_key_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -414,6 +465,10 @@ class GenerateImageTests(unittest.TestCase):
     def test_portdan_api_key_environment_is_final_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(self.resolve(Path(temp), {"PORTDAN_API_KEY": KEY}), KEY)
+            self.assertEqual(
+                self.resolve_request(Path(temp), {"PORTDAN_API_KEY": KEY}).model,
+                generate_image.DEFAULT_RESPONSE_MODEL,
+            )
 
     def test_non_portdan_auth_json_is_not_used(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -466,36 +521,43 @@ class GenerateImageTests(unittest.TestCase):
             self.assertEqual(stderr.getvalue().strip(), generate_image.MISSING_KEY_MESSAGE)
             post.assert_not_called()
 
-    def test_payload_uses_direct_images_api_and_all_quality_levels(self) -> None:
-        self.assertEqual(
-            generate_image.ENDPOINT, "https://portdan.com/v1/images/generations"
-        )
+    def test_payload_uses_responses_image_tool_and_all_quality_levels(self) -> None:
+        self.assertEqual(generate_image.ENDPOINT, "https://portdan.com/v1/responses")
+        request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
         for quality in generate_image.QUALITIES:
             with self.subTest(quality=quality):
                 payload = json.loads(
-                    generate_image._payload("a dog", "1024x1024", quality)
+                    generate_image._payload(
+                        request_config, "a dog", "1024x1024", quality
+                    )
                 )
                 self.assertEqual(payload, {
-                    "model": "gpt-image-2",
-                    "prompt": "a dog",
-                    "n": 1,
-                    "size": "1024x1024",
-                    "quality": quality,
-                    "response_format": "b64_json",
-                    "output_format": "png",
+                    "model": MODEL,
+                    "input": "a dog",
+                    "tools": [{
+                        "type": "image_generation",
+                        "action": "generate",
+                        "model": "gpt-image-2",
+                        "quality": quality,
+                        "size": "1024x1024",
+                        "output_format": "png",
+                    }],
+                    "tool_choice": {"type": "image_generation"},
+                    "store": False,
                     "stream": False,
                 })
-                self.assertNotIn("tools", payload)
-                self.assertNotIn("input", payload)
 
     def test_main_posts_once_writes_png_and_reports_model_and_elapsed_time(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             stdout, stderr = io.StringIO(), io.StringIO()
             request = Mock(return_value=response_body())
-            with patch.object(generate_image, "resolve_api_key", return_value=KEY), patch.object(
-                generate_image, "_post", request
-            ), patch.object(Path, "cwd", return_value=directory), patch.object(
+            request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
+            with patch.object(
+                generate_image, "resolve_request_config", return_value=request_config
+            ), patch.object(generate_image, "_post", request), patch.object(
+                Path, "cwd", return_value=directory
+            ), patch.object(
                 sys, "stdin", io.StringIO("a dog")
             ), patch.object(
                 generate_image.time, "monotonic", side_effect=[10.0, 12.25]
@@ -507,8 +569,9 @@ class GenerateImageTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
             self.assertEqual(request.call_args.args[0], KEY)
             payload = json.loads(request.call_args.args[1])
-            self.assertEqual(payload["model"], "gpt-image-2")
-            self.assertEqual(payload["quality"], "low")
+            self.assertEqual(payload["model"], MODEL)
+            self.assertEqual(payload["tools"][0]["model"], "gpt-image-2")
+            self.assertEqual(payload["tools"][0]["quality"], "low")
             output = Path(stdout.getvalue().strip())
             self.assertTrue(output.is_absolute())
             self.assertEqual(output.read_bytes(), PNG)
@@ -540,14 +603,26 @@ class GenerateImageTests(unittest.TestCase):
         self.assertNotIn(b"tEXt", cleaned)
         self.assertEqual(generate_image._sanitize_png(cleaned), cleaned)
 
-    def test_direct_images_data_url_is_supported(self) -> None:
+    def test_responses_image_generation_result_is_supported(self) -> None:
         raw = json.dumps({
-            "data": [{"url": "data:image/png;base64," + base64.b64encode(PNG).decode("ascii")}]
+            "output": [{
+                "type": "message",
+                "content": [],
+            }, {
+                "type": "image_generation_call",
+                "result": "data:image/png;base64," + base64.b64encode(PNG).decode("ascii"),
+            }]
         }).encode()
         self.assertEqual(generate_image._image_bytes(raw), PNG)
 
-    def test_invalid_direct_images_response_is_reported(self) -> None:
-        for raw in (b"{}", b'{"data":[]}', b'{"output":[]}'):
+    def test_invalid_responses_image_output_is_reported(self) -> None:
+        for raw in (
+            b"{}",
+            b'{"data":[]}',
+            b'{"output":[]}',
+            b'{"output":[{"type":"image_generation_call"}]}',
+            b'{"output":[{"type":"image_generation_call","result":"a"},{"type":"image_generation_call","result":"b"}]}',
+        ):
             with self.subTest(raw=raw), self.assertRaises(generate_image.ResponseError):
                 generate_image._image_bytes(raw)
 
@@ -577,7 +652,7 @@ class GenerateImageTests(unittest.TestCase):
         )
         self.assertEqual(proxy.proxies, {})
 
-    def test_post_opens_the_fixed_images_endpoint_exactly_once(self) -> None:
+    def test_post_opens_the_fixed_responses_endpoint_exactly_once(self) -> None:
         class Response:
             status = 200
 
@@ -601,7 +676,7 @@ class GenerateImageTests(unittest.TestCase):
 
         opener.open.assert_called_once()
         request = opener.open.call_args.args[0]
-        self.assertEqual(request.full_url, "https://portdan.com/v1/images/generations")
+        self.assertEqual(request.full_url, "https://portdan.com/v1/responses")
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.data, body)
         self.assertEqual(opener.open.call_args.kwargs["timeout"], 12.5)
@@ -614,19 +689,23 @@ class GenerateImageTests(unittest.TestCase):
         )
 
     def test_http_errors_do_not_retry(self) -> None:
-        with patch.object(generate_image, "resolve_api_key", return_value=KEY), patch.object(
+        request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
+        with patch.object(
+            generate_image, "resolve_request_config", return_value=request_config
+        ), patch.object(
             generate_image, "_post", side_effect=generate_image.RequestError(429)
-        ) as post, patch.object(sys, "stdin", io.StringIO("a dog")), contextlib.redirect_stdout(
-            io.StringIO()
-        ), contextlib.redirect_stderr(io.StringIO()):
+        ) as post, patch.object(
+            sys, "stdin", io.StringIO("a dog")
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = generate_image.main(["--prompt-stdin", "--quality", "medium"])
         self.assertEqual(code, 4)
         self.assertEqual(post.call_count, 1)
 
     def test_auth_and_server_failures_submit_only_once(self) -> None:
+        request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
         for status in (0, 401, 403, 500):
             with self.subTest(status=status), patch.object(
-                generate_image, "resolve_api_key", return_value=KEY
+                generate_image, "resolve_request_config", return_value=request_config
             ), patch.object(
                 generate_image, "_post", side_effect=generate_image.RequestError(status)
             ) as post, patch.object(sys, "stdin", io.StringIO("a dog")), contextlib.redirect_stdout(
@@ -637,6 +716,7 @@ class GenerateImageTests(unittest.TestCase):
             self.assertIn(code, (3, 4))
 
     def test_key_never_appears_in_cli_failure_output(self) -> None:
+        request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
         scenarios = (
             generate_image.RequestError(401),
             generate_image.RequestError(404),
@@ -647,7 +727,7 @@ class GenerateImageTests(unittest.TestCase):
             with self.subTest(status=failure.status):
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with patch.object(
-                    generate_image, "resolve_api_key", return_value=KEY
+                    generate_image, "resolve_request_config", return_value=request_config
                 ), patch.object(
                     generate_image, "_post", side_effect=failure
                 ), patch.object(
@@ -656,6 +736,11 @@ class GenerateImageTests(unittest.TestCase):
                     generate_image.main(["--prompt-stdin", "--quality", "low"])
                 self.assertNotIn(KEY, stdout.getvalue())
                 self.assertNotIn(KEY, stderr.getvalue())
+
+    def test_404_message_is_factual_and_does_not_guess_channel_state(self) -> None:
+        message = generate_image._error_message(generate_image.RequestError(404))
+        self.assertEqual(message, "Portdan 返回 404，图片请求未完成")
+        self.assertNotIn("图片通道", message)
 
     def test_main_does_not_modify_codex_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

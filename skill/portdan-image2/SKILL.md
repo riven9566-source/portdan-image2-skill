@@ -2,7 +2,7 @@
 name: portdan-image2
 description: >-
   Generate one text-to-image PNG by calling OpenAI gpt-image-2 through the
-  user's Portdan API Key and fixed Portdan Images endpoint. Use whenever the
+  user's Portdan API Key and fixed Portdan Responses endpoint. Use whenever the
   user asks for Portdan image generation, Image2, gpt-image-2, or wants to use
   Portdan credits instead of the Codex/ChatGPT account image channel. Ask once
   for fast, balanced, or high quality when quality is not specified, then run
@@ -56,9 +56,13 @@ Do not inspect configuration manually, browse API docs, probe models, query
 quota, poll, or retry. The runner fixes the request to:
 
 ```text
-POST https://portdan.com/v1/images/generations
-model=gpt-image-2, n=1, output_format=png, response_format=b64_json
+POST https://portdan.com/v1/responses
+tools[0]: type=image_generation, action=generate, model=gpt-image-2, output_format=png
 ```
+
+The outer Responses model uses the compatible current Codex model found with
+the same Key; if it is missing or cannot use the image tool, it uses
+`gpt-5.4-mini`. Only the Key is required.
 
 6. On exit code 0, display the returned local image when supported and return
    its absolute path. Say: `已通过 Portdan 调用 OpenAI gpt-image-2 生成` and
@@ -92,9 +96,11 @@ Do not ask the user to paste a Key into chat.
 ## Failures
 
 - Missing Python: report that Python 3.9+ is required; do not install it.
-- 401/403: report that the Portdan Key is invalid or the current group lacks
-  `gpt-image-2` access.
+- 401/403: report that Portdan rejected authentication or the current group is
+  not authorized for the image request.
 - 429: report Portdan rate limiting and stop.
+- 404: report only that Portdan returned 404 and the image request did not
+  complete; do not guess the channel state.
 - Other 4xx: report that Portdan rejected the image request and stop.
 - Timeout or 5xx: report that the request may have reached Portdan and stop.
 - Invalid response or save failure: report the concise runner error and stop.

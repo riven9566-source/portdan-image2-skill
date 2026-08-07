@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one PNG with OpenAI gpt-image-2 through the Portdan Images API."""
+"""Generate one PNG with OpenAI gpt-image-2 through Portdan Responses API."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import stat
 import sys
 import time
 import zlib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, Mapping, Optional
 from urllib.error import HTTPError, URLError
@@ -28,8 +29,9 @@ except ModuleNotFoundError:  # Python 3.9/3.10
 
 
 HOST = "portdan.com"
-ENDPOINT = "https://portdan.com/v1/images/generations"
+ENDPOINT = "https://portdan.com/v1/responses"
 IMAGE_MODEL = "gpt-image-2"
+DEFAULT_RESPONSE_MODEL = "gpt-5.4-mini"
 MISSING_KEY_MESSAGE = "未找到 Portdan API Key，请先在 CC Switch 中选择 Portdan，或设置 PORTDAN_API_KEY"
 SIZES = ("1024x1024", "1536x1024", "1024x1536")
 QUALITIES = ("low", "medium", "high")
@@ -62,6 +64,12 @@ class OutputRecoveryError(RuntimeError):
     def __init__(self, path: Path) -> None:
         self.path = path
         super().__init__(str(path))
+
+
+@dataclass(frozen=True)
+class RequestConfig:
+    api_key: str = field(repr=False)
+    model: str = DEFAULT_RESPONSE_MODEL
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -262,6 +270,25 @@ def _auth_key(auth: Any) -> Optional[str]:
     return _maybe_key(payload.get("OPENAI_API_KEY"))
 
 
+def _configured_model(config: Any) -> str:
+    if not isinstance(config, dict):
+        return DEFAULT_RESPONSE_MODEL
+    value = config.get("model")
+    if not isinstance(value, str):
+        return DEFAULT_RESPONSE_MODEL
+    model = value.strip()
+    if (
+        not model
+        or len(model) > 256
+        or any(ord(character) < 33 or character.isspace() for character in model)
+    ):
+        return DEFAULT_RESPONSE_MODEL
+    normalized = re.sub(r"[^a-z0-9]+", "", model.casefold())
+    if "gpt-image-" in model.casefold() or "gpt53codexspark" in normalized:
+        return DEFAULT_RESPONSE_MODEL
+    return model
+
+
 def _configured_providers(config: Dict[str, Any]) -> list[tuple[str, Dict[str, Any]]]:
     active = config.get("model_provider")
     providers = config.get("model_providers")
@@ -325,7 +352,15 @@ def _key_from_provider(
 def _key_from_config(
     config: Dict[str, Any], auth: Any, environ: Mapping[str, str]
 ) -> Optional[str]:
+    request_config = _request_config_from_config(config, auth, environ)
+    return request_config.api_key if request_config is not None else None
+
+
+def _request_config_from_config(
+    config: Dict[str, Any], auth: Any, environ: Mapping[str, str]
+) -> Optional[RequestConfig]:
     providers = _configured_providers(config)
+    model = _configured_model(config)
     active = config.get("model_provider")
     active_provider = next(
         (
@@ -339,15 +374,16 @@ def _key_from_config(
         _, provider = active_provider
         direct = _key_from_provider(provider, environ)
         if direct:
-            return direct
+            return RequestConfig(api_key=direct, model=model)
         auth_key = _auth_key(auth)
         if auth_key:
-            return auth_key
+            return RequestConfig(api_key=auth_key, model=model)
 
-    if _top_level_portdan_applies(config, providers):
+    top_level_portdan = _top_level_portdan_applies(config, providers)
+    if top_level_portdan:
         auth_key = _auth_key(auth)
         if auth_key:
-            return auth_key
+            return RequestConfig(api_key=auth_key, model=model)
 
     candidates: set[str] = set()
     portdan_providers = [
@@ -360,9 +396,16 @@ def _key_from_config(
         if direct:
             candidates.add(direct)
     if len(candidates) == 1:
-        return next(iter(candidates))
+        selected_model = (
+            model
+            if top_level_portdan or (len(providers) == 1 and len(portdan_providers) == 1)
+            else DEFAULT_RESPONSE_MODEL
+        )
+        return RequestConfig(api_key=next(iter(candidates)), model=selected_model)
     if len(providers) == 1 and len(portdan_providers) == 1:
-        return _auth_key(auth)
+        auth_key = _auth_key(auth)
+        if auth_key:
+            return RequestConfig(api_key=auth_key, model=model)
     return None
 
 
@@ -374,11 +417,14 @@ def _read_auth(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _key_from_config_root(root: Path, environ: Mapping[str, str]) -> Optional[str]:
+def _request_config_from_config_root(
+    root: Path, environ: Mapping[str, str]
+) -> Optional[RequestConfig]:
     try:
         config = _parse_config(_read_small_file(root / "config.toml", MAX_CONFIG_BYTES))
     except ConfigError:
         return None
+    model = _configured_model(config)
     providers = _configured_providers(config)
     active = config.get("model_provider")
     active_provider = next(
@@ -394,18 +440,25 @@ def _key_from_config_root(root: Path, environ: Mapping[str, str]) -> Optional[st
     if active_provider is not None:
         direct = _key_from_provider(active_provider, environ)
         if direct:
-            return direct
+            return RequestConfig(api_key=direct, model=model)
     elif not _top_level_portdan_applies(config, providers) and len(providers) == 1:
         name, provider = providers[0]
         if _provider_is_portdan(name, provider):
             direct = _key_from_provider(provider, environ)
             if direct:
-                return direct
+                return RequestConfig(api_key=direct, model=model)
     auth = _read_auth(root / "auth.json") if _config_auth_allowed(config, providers) else None
-    return _key_from_config(config, auth, environ)
+    return _request_config_from_config(config, auth, environ)
 
 
-def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Optional[str]:
+def _key_from_config_root(root: Path, environ: Mapping[str, str]) -> Optional[str]:
+    request_config = _request_config_from_config_root(root, environ)
+    return request_config.api_key if request_config is not None else None
+
+
+def _request_config_from_cc_switch_database(
+    home: Path, environ: Mapping[str, str]
+) -> Optional[RequestConfig]:
     database = home / ".cc-switch" / "cc-switch.db"
     try:
         resolved = database.resolve(strict=True)
@@ -444,6 +497,14 @@ def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Opti
         settings = _json_object(row[0] if row else None)
         if settings is None:
             continue
+        config_text = settings.get("config")
+        config: Optional[Dict[str, Any]] = None
+        if isinstance(config_text, str):
+            try:
+                config = _parse_config(config_text.encode("utf-8"))
+            except (ConfigError, UnicodeEncodeError):
+                config = None
+        model = _configured_model(config)
         identity = dict(zip(identity_columns, row[1:]))
         identity_is_portdan = (
             isinstance(identity.get("name"), str)
@@ -452,25 +513,23 @@ def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Opti
         if identity_is_portdan:
             key = _auth_key(settings.get("auth"))
             if key:
-                return key
-        config_text = settings.get("config")
-        config: Optional[Dict[str, Any]] = None
-        if isinstance(config_text, str):
-            try:
-                config = _parse_config(config_text.encode("utf-8"))
-            except (ConfigError, UnicodeEncodeError):
-                config = None
+                return RequestConfig(api_key=key, model=model)
         if config is not None and _config_auth_allowed(
             config, _configured_providers(config)
         ):
             key = _auth_key(settings.get("auth"))
             if key:
-                return key
+                return RequestConfig(api_key=key, model=model)
         if config is not None:
-            key = _key_from_config(config, None, environ)
-            if key:
-                return key
+            request_config = _request_config_from_config(config, None, environ)
+            if request_config is not None:
+                return request_config
     return None
+
+
+def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Optional[str]:
+    request_config = _request_config_from_cc_switch_database(home, environ)
+    return request_config.api_key if request_config is not None else None
 
 
 def _custom_codex_root(home: Path) -> Optional[Path]:
@@ -521,31 +580,40 @@ def _candidate_config_roots(
         yield default
 
 
-def resolve_api_key() -> str:
+def resolve_request_config() -> RequestConfig:
     home = Path.home()
     environ = os.environ
-    key = _key_from_cc_switch_database(home, environ)
-    if key:
-        return key
+    request_config = _request_config_from_cc_switch_database(home, environ)
+    if request_config is not None:
+        return request_config
     for root in _candidate_config_roots(home, environ):
-        key = _key_from_config_root(root, environ)
-        if key:
-            return key
+        request_config = _request_config_from_config_root(root, environ)
+        if request_config is not None:
+            return request_config
     key = _maybe_key(environ.get("PORTDAN_API_KEY"))
     if key:
-        return key
+        return RequestConfig(api_key=key)
     raise ConfigError()
 
 
-def _payload(prompt: str, size: str, quality: str) -> bytes:
+def resolve_api_key() -> str:
+    return resolve_request_config().api_key
+
+
+def _payload(request_config: RequestConfig, prompt: str, size: str, quality: str) -> bytes:
     body = {
-        "model": IMAGE_MODEL,
-        "prompt": prompt,
-        "n": 1,
-        "size": size,
-        "quality": quality,
-        "response_format": "b64_json",
-        "output_format": "png",
+        "model": request_config.model,
+        "input": prompt,
+        "tools": [{
+            "type": "image_generation",
+            "action": "generate",
+            "model": IMAGE_MODEL,
+            "quality": quality,
+            "size": size,
+            "output_format": "png",
+        }],
+        "tool_choice": {"type": "image_generation"},
+        "store": False,
         "stream": False,
     }
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -560,7 +628,7 @@ def _post(api_key: str, body: bytes, timeout: float) -> bytes:
             "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "portdan-image2-skill/3.0",
+            "User-Agent": "portdan-image2-skill/4.0",
         },
     )
     opener = build_opener(ProxyHandler({}), _NoRedirect())
@@ -582,15 +650,17 @@ def _image_bytes(raw: bytes) -> bytes:
         response = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ResponseError() from exc
-    output = response.get("data") if isinstance(response, dict) else None
-    if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
+    output = response.get("output") if isinstance(response, dict) else None
+    if not isinstance(output, list):
         raise ResponseError()
-    value = output[0].get("b64_json")
-    if not isinstance(value, str):
-        url = output[0].get("url")
-        value = url if isinstance(url, str) and url.lower().startswith("data:image/") else None
-    if not isinstance(value, str):
+    calls = [
+        item
+        for item in output
+        if isinstance(item, dict) and item.get("type") == "image_generation_call"
+    ]
+    if len(calls) != 1 or not isinstance(calls[0].get("result"), str):
         raise ResponseError()
+    value = calls[0]["result"]
     if value.startswith("data:") and "," in value:
         value = value.split(",", 1)[1]
     try:
@@ -787,14 +857,14 @@ def _parser() -> argparse.ArgumentParser:
 
 def _error_message(error: RequestError) -> str:
     if error.status in (401, 403):
-        return "Portdan API Key 无效，或当前分组未开放 gpt-image-2"
+        return "Portdan 拒绝了认证或当前分组未授权图片请求"
     if error.status == 429:
         return "Portdan 当前限流，请稍后再试"
     if error.status == 404:
-        return "Portdan 当前未找到可用的 gpt-image-2 图片通道"
+        return "Portdan 返回 404，图片请求未完成"
     if error.status == 0 or error.status >= 500:
         return "Portdan 请求失败；请求可能已经到达后台，请先检查 Portdan 记录后再决定是否重试"
-    return "Portdan 拒绝了图片请求，请检查当前分组是否支持 gpt-image-2"
+    return "Portdan 拒绝了图片请求"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -805,8 +875,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         started = time.monotonic()
         prompt = _prompt_from_stdin()
-        api_key = resolve_api_key()
-        body = _payload(prompt, args.size, args.quality)
+        request_config = resolve_request_config()
+        body = _payload(request_config, prompt, args.size, args.quality)
         print(
             "正在通过 Portdan 调用 OpenAI gpt-image-2（{}）生成图片…".format(
                 QUALITY_LABELS[args.quality]
@@ -814,7 +884,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
             flush=True,
         )
-        raw = _post(api_key, body, min(args.timeout, 900.0))
+        raw = _post(request_config.api_key, body, min(args.timeout, 900.0))
         image = _image_bytes(raw)
         output = _save_png(image).absolute()
         print(output)

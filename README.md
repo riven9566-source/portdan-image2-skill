@@ -1,6 +1,6 @@
 # Portdan Image2 Skill
 
-让 Codex 通过 Portdan 直接调用 OpenAI `gpt-image-2` 生成一张 PNG。
+让 Codex 通过 Portdan Responses API 调用 OpenAI `gpt-image-2` 生成一张 PNG。
 
 - OpenAI 提供真正的 `gpt-image-2` 生图模型。
 - Portdan 提供 API 接入与计费通道。
@@ -67,14 +67,16 @@ py -3 .\install.py
 
 ```text
 本机已有的 Portdan Key
-  → POST https://portdan.com/v1/images/generations
-  → OpenAI gpt-image-2
-  → data[0].b64_json
+  → POST https://portdan.com/v1/responses
+  → Responses image_generation（OpenAI gpt-image-2）
+  → output[].image_generation_call.result
   → 本地 PNG
 ```
 
-请求固定为单图、非流式、一次提交：`model=gpt-image-2`、`n=1`、PNG。
-不经过 Responses 外层文本模型，不进行模型探测、轮询或自动重试。
+请求固定为单图、非流式、一次提交：图片工具使用 `action=generate`、
+`model=gpt-image-2` 和 PNG。外层 Responses 模型优先采用找到 Key 的同一份
+Codex 配置中的兼容当前模型；没有模型或当前模型不支持图片工具时回退
+`gpt-5.4-mini`。只有 Key 是必需的，不会探测模型、预检、轮询或自动重试。
 
 ## Key 如何自动读取
 
@@ -90,7 +92,8 @@ py -3 .\install.py
 兼容 CC Switch provider 数据、`experimental_bearer_token`、`env_key`，以及
 `openai_base_url` / `requires_openai_auth` 配合 `auth.json` 中
 `OPENAI_API_KEY` 的常见配置。无需完整的 `model_provider`、`model`、
-`wire_api` 或可变 Base URL。
+`wire_api` 或可变 Base URL。配置中有当前 Codex 模型时会一并采用，没有也不
+影响生图。
 
 找不到 Key 时只提示：
 
@@ -100,16 +103,16 @@ py -3 .\install.py
 
 常见错误会保持简短：
 
-- `401/403`：Key 无效，或当前分组未开放 `gpt-image-2`；
-- `404`：Portdan 当前未找到可用的 `gpt-image-2` 图片通道；
+- `401/403`：Portdan 拒绝认证，或当前分组未授权图片请求；
+- `404`：Portdan 返回 404，图片请求未完成；
 - `429`：Portdan 当前限流；
 - 超时或 `5xx`：请求可能已到达后台，Skill 不会自动重复提交。
 
 ## 为什么保留 Python
 
 Codex 内置生图工具不能传入用户自己的 Portdan URL 和 Key，直接使用会走另一
-条账号生图通道。Python 不是生图模型，只是一个跨平台本地请求器；真正生成
-图片的是通过 Portdan 调用的 OpenAI `gpt-image-2`。
+条账号生图通道。Python 不是生图模型，只负责找 Key、发送 Responses 请求和
+保存文件；真正生成图片的是通过 Portdan 调用的 OpenAI `gpt-image-2`。
 
 ## 本地开发验证
 

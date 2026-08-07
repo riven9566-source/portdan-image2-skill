@@ -20,7 +20,7 @@ import skill_manifest  # noqa: E402
 
 
 class ProjectToolTests(unittest.TestCase):
-    def test_public_docs_describe_the_direct_openai_image_route(self) -> None:
+    def test_public_docs_describe_the_portdan_responses_image_route(self) -> None:
         skill = (ROOT / "skill" / "portdan-image2" / "SKILL.md").read_text(
             encoding="utf-8"
         )
@@ -30,8 +30,9 @@ class ProjectToolTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         public_text = "\n".join((skill, readme, metadata))
 
-        self.assertNotIn("/v1/responses", public_text.lower())
-        self.assertIn("https://portdan.com/v1/images/generations", public_text)
+        self.assertIn("https://portdan.com/v1/responses", public_text)
+        self.assertNotIn("/v1/images/generations", public_text.lower())
+        self.assertIn("image_generation_call.result", public_text)
         self.assertIn("OpenAI `gpt-image-2`", skill)
         self.assertIn("Portdan as the API access and billing channel", skill)
         self.assertIn("快速、均衡还是高清", public_text)

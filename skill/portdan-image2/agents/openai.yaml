@@ -1,6 +1,6 @@
 interface:
   display_name: "Portdan Image2"
-  short_description: "通过 Portdan 调用 OpenAI gpt-image-2 单张生图"
+  short_description: "通过 Portdan Responses 调用 OpenAI gpt-image-2"
   default_prompt: "使用 $portdan-image2 生成一张图片；如果我没指定画质，只问我选择快速、均衡或高清。"
 
 policy:
