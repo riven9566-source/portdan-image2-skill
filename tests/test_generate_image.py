@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import hashlib
+import http.client
 import io
 import json
 import os
+import socket
 import sqlite3
+import ssl
 import tempfile
 import threading
 import unittest
+from email.message import Message
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -27,6 +32,17 @@ PNG = base64.b64decode(
 KEY = "portdan-test-key-123456"
 OTHER_KEY = "portdan-other-key-654321"
 MODEL = "gpt-5.6-sol"
+MISSING = object()
+
+
+class TtyInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class UnverifiableTtyInput(io.StringIO):
+    def isatty(self) -> bool:
+        raise OSError("unable to determine terminal state")
 
 
 def response_body() -> bytes:
@@ -61,22 +77,70 @@ class GenerateImageTests(unittest.TestCase):
         auth: dict,
         current: int = 1,
         name: str = "Portdan",
+        provider_id: str = "provider-1",
+        website_url: str | None = None,
+        current_provider_id: object = MISSING,
+    ) -> None:
+        self.write_cc_database_rows(
+            home,
+            [{
+                "id": provider_id,
+                "current": current,
+                "name": name,
+                "website_url": website_url,
+                "config": config,
+                "auth": auth,
+            }],
+            current_provider_id=current_provider_id,
+        )
+
+    def write_cc_database_rows(
+        self,
+        home: Path,
+        rows: list[dict],
+        *,
+        current_provider_id: object = MISSING,
+        include_id: bool = True,
     ) -> None:
         directory = home / ".cc-switch"
         directory.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(directory / "cc-switch.db")
         try:
-            connection.execute(
-                "CREATE TABLE providers "
-                "(app_type TEXT, is_current INTEGER, name TEXT, settings_config TEXT)"
-            )
-            connection.execute(
-                "INSERT INTO providers VALUES (?, ?, ?, ?)",
-                ("codex", current, name, json.dumps({"config": config, "auth": auth})),
-            )
+            columns = [
+                "app_type TEXT",
+                "is_current INTEGER",
+                "name TEXT",
+                "website_url TEXT",
+                "settings_config TEXT",
+            ]
+            if include_id:
+                columns.insert(0, "id TEXT")
+            connection.execute("CREATE TABLE providers ({})".format(", ".join(columns)))
+            for row in rows:
+                values = [
+                    "codex",
+                    row.get("current", 0),
+                    row.get("name", "Custom provider"),
+                    row.get("website_url"),
+                    json.dumps({
+                        "config": row.get("config", ""),
+                        "auth": row.get("auth", {}),
+                    }),
+                ]
+                if include_id:
+                    values.insert(0, row.get("id"))
+                placeholders = ", ".join("?" for _ in values)
+                connection.execute(
+                    "INSERT INTO providers VALUES ({})".format(placeholders), values
+                )
             connection.commit()
         finally:
             connection.close()
+        if current_provider_id is not MISSING:
+            (directory / "settings.json").write_text(
+                json.dumps({"currentProviderCodex": current_provider_id}),
+                encoding="utf-8",
+            )
 
     def resolve(self, home: Path, env: dict[str, str] | None = None) -> str:
         with patch.object(Path, "home", return_value=home), patch.dict(
@@ -111,42 +175,32 @@ class GenerateImageTests(unittest.TestCase):
                 MODEL,
             )
 
-    def test_cc_switch_current_provider_needs_only_its_auth_key(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            home = Path(temp)
-            directory = home / ".cc-switch"
-            directory.mkdir(parents=True)
-            connection = sqlite3.connect(directory / "cc-switch.db")
-            try:
-                connection.execute(
-                    "CREATE TABLE providers "
-                    "(app_type TEXT, is_current INTEGER, name TEXT, settings_config TEXT)"
-                )
-                connection.execute(
-                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
-                    (
-                        "codex",
-                        1,
-                        "Portdan",
-                        json.dumps({"auth": {"OPENAI_API_KEY": KEY}}),
-                    ),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-            self.assertEqual(self.resolve(home), KEY)
-
-    def test_named_portdan_cc_switch_provider_uses_auth_when_config_is_invalid(self) -> None:
+    def test_cc_switch_current_provider_website_url_can_prove_portdan(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_cc_database(
                 home,
-                "this provider config does not need to be parsed",
+                "this config is intentionally not parseable",
                 {"OPENAI_API_KEY": KEY},
+                name="Customer-defined name",
+                website_url="https://portdan.com/v1/responses",
             )
             request_config = self.resolve_request(home)
             self.assertEqual(request_config.api_key, KEY)
-            self.assertEqual(request_config.model, generate_image.DEFAULT_RESPONSE_MODEL)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_CC_SWITCH)
+
+    def test_provider_name_alone_does_not_authorize_its_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database(
+                home,
+                "this provider config is not parseable",
+                {"OPENAI_API_KEY": OTHER_KEY},
+                name="Portdan",
+            )
+            request_config = self.resolve_request(home, {"PORTDAN_API_KEY": KEY})
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_ENV)
 
     def test_non_portdan_current_cc_switch_key_is_not_sent_to_portdan(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -170,13 +224,239 @@ class GenerateImageTests(unittest.TestCase):
             )
             self.assertEqual(self.resolve(home, {"PORTDAN_API_KEY": KEY}), KEY)
 
+    def test_current_provider_codex_overrides_stale_is_current_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database_rows(
+                home,
+                [{
+                    "id": "chosen-customer-provider",
+                    "current": 0,
+                    "name": "Customer billing route",
+                    "config": 'openai_base_url = "https://portdan.com/v1/responses"\n',
+                    "auth": {"CODEX_API_KEY": KEY},
+                }, {
+                    "id": "stale-row",
+                    "current": 1,
+                    "name": "Old OpenAI",
+                    "config": 'openai_base_url = "https://api.openai.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": OTHER_KEY},
+                }],
+                current_provider_id="chosen-customer-provider",
+            )
+            request_config = self.resolve_request(home)
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_CC_SWITCH)
+
+    def test_selected_foreign_provider_does_not_fall_back_to_stale_portdan_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database_rows(
+                home,
+                [{
+                    "id": "selected-foreign",
+                    "current": 0,
+                    "config": 'openai_base_url = "https://api.openai.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": OTHER_KEY},
+                }, {
+                    "id": "stale-portdan",
+                    "current": 1,
+                    "config": 'openai_base_url = "https://portdan.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": OTHER_KEY},
+                }],
+                current_provider_id="selected-foreign",
+            )
+            request_config = self.resolve_request(home, {"PORTDAN_API_KEY": KEY})
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_ENV)
+
+    def test_current_provider_codex_compatibility_fallbacks_use_is_current(self) -> None:
+        scenarios = (
+            (MISSING, True),
+            ("missing-provider-id", True),
+            (["not", "a", "string"], True),
+            ("provider-1", False),
+        )
+        for current_provider_id, include_id in scenarios:
+            with self.subTest(
+                current_provider_id=current_provider_id, include_id=include_id
+            ), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp)
+                self.write_cc_database_rows(
+                    home,
+                    [{
+                        "id": "provider-1",
+                        "current": 1,
+                        "name": "Arbitrary name",
+                        "config": 'openai_base_url = "https://portdan.com/v1"\n',
+                        "auth": {"API_KEY": KEY},
+                    }],
+                    current_provider_id=current_provider_id,
+                    include_id=include_id,
+                )
+                self.assertEqual(self.resolve(home), KEY)
+
+    def test_current_provider_codex_requires_an_exact_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database_rows(
+                home,
+                [{
+                    "id": "chosen-provider",
+                    "current": 0,
+                    "config": 'openai_base_url = "https://portdan.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": KEY},
+                }],
+                current_provider_id=" chosen-provider ",
+            )
+            request_config = self.resolve_request(home, {"PORTDAN_API_KEY": OTHER_KEY})
+            self.assertEqual(request_config.api_key, OTHER_KEY)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_ENV)
+
+    def test_current_provider_id_lookup_does_not_require_is_current_column(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            directory = home / ".cc-switch"
+            directory.mkdir()
+            connection = sqlite3.connect(directory / "cc-switch.db")
+            try:
+                connection.execute(
+                    "CREATE TABLE providers "
+                    "(id TEXT, app_type TEXT, website_url TEXT, settings_config TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?)",
+                    (
+                        "selected-provider",
+                        "codex",
+                        "https://portdan.com/v1/responses",
+                        json.dumps({
+                            "config": "invalid TOML",
+                            "auth": {"API_KEY": KEY},
+                        }),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            (directory / "settings.json").write_text(
+                json.dumps({"currentProviderCodex": "selected-provider"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(self.resolve(home), KEY)
+
+    def test_is_current_fallback_uses_only_the_latest_matching_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database_rows(
+                home,
+                [{
+                    "id": "stale-portdan",
+                    "current": 1,
+                    "config": 'openai_base_url = "https://portdan.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": OTHER_KEY},
+                }, {
+                    "id": "latest-foreign",
+                    "current": 1,
+                    "config": 'openai_base_url = "https://api.openai.com/v1"\n',
+                    "auth": {"OPENAI_API_KEY": OTHER_KEY},
+                }],
+            )
+            request_config = self.resolve_request(home, {"PORTDAN_API_KEY": KEY})
+            self.assertEqual(request_config.api_key, KEY)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_ENV)
+
+    def test_portdan_url_allowlist_accepts_supported_paths_only(self) -> None:
+        accepted = (
+            "https://portdan.com",
+            "https://portdan.com/",
+            "https://portdan.com:443/v1",
+            "https://portdan.com/v1/",
+            "https://portdan.com/v1/responses",
+            "https://portdan.com/v1/responses/",
+            "https://portdan.com/backend-api/codex",
+            "https://portdan.com/backend-api/codex/",
+        )
+        rejected = (
+            "http://portdan.com/v1",
+            "https://portdan.com:444/v1",
+            "https://portdan.com.evil/v1",
+            "https://example.com/https://portdan.com/v1",
+            "https://user@portdan.com/v1",
+            "https://portdan.com/v1/other",
+            "https://portdan.com/v1////",
+            "https://portdan.com/v1?key=value",
+            "https://portdan.com/v1#fragment",
+            " https://portdan.com/v1",
+            "https://portdan.com/v1 ",
+        )
+        for value in accepted:
+            with self.subTest(value=value):
+                self.assertTrue(generate_image._is_portdan_url(value))
+        for value in rejected:
+            with self.subTest(value=value):
+                self.assertFalse(generate_image._is_portdan_url(value))
+
+    def test_cc_switch_explicit_auth_key_aliases_are_supported(self) -> None:
+        for field_name in generate_image.PROVIDER_KEY_FIELDS:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp)
+                self.write_cc_database(
+                    home,
+                    "invalid toml; website URL supplies provider identity",
+                    {field_name: KEY},
+                    name="Customer alias",
+                    website_url="https://portdan.com/v1",
+                )
+                request_config = self.resolve_request(home)
+                self.assertEqual(request_config.api_key, KEY)
+                self.assertEqual(
+                    request_config.source, generate_image.KEY_SOURCE_CC_SWITCH
+                )
+
+    def test_unknown_auth_and_provider_token_fields_are_not_guessed(self) -> None:
+        unknown_auth_fields = (
+            "access_token",
+            "refresh_token",
+            "token",
+            "bearer_token",
+            "authorization",
+            "secret",
+        )
+        for field_name in unknown_auth_fields:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp)
+                self.write_cc_database(
+                    home,
+                    'openai_base_url = "https://portdan.com/v1"\n',
+                    {field_name: OTHER_KEY},
+                    name="Customer alias",
+                )
+                with self.assertRaises(generate_image.ConfigError):
+                    self.resolve(home)
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_config(
+                home / ".codex",
+                '[model_providers.customer_alias]\n'
+                'base_url = "https://portdan.com/v1"\n'
+                'access_token = "{}"\n'
+                'refresh_token = "{}"\n'
+                'token = "{}"\n'.format(KEY, KEY, KEY),
+            )
+            with self.assertRaises(generate_image.ConfigError):
+                self.resolve(home)
+
     def test_cc_switch_database_config_inline_token_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_cc_database(
                 home,
-                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
+                '[model_providers.any_name]\nbase_url = "https://portdan.com/v1"\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
                 {},
+                name="Not Portdan",
             )
             self.assertEqual(self.resolve(home), KEY)
             self.assertEqual(
@@ -203,7 +483,8 @@ class GenerateImageTests(unittest.TestCase):
             home = Path(temp)
             self.write_cc_database(
                 home,
-                '[model_providers.portdan]\nenv_key = "PORTDAN_TEST_KEY"\n',
+                '[model_providers.any_name]\nbase_url = "https://portdan.com/v1"\n'
+                'env_key = "PORTDAN_TEST_KEY"\n',
                 {},
             )
             self.assertEqual(self.resolve(home, {"PORTDAN_TEST_KEY": KEY}), KEY)
@@ -216,26 +497,43 @@ class GenerateImageTests(unittest.TestCase):
             database.write_bytes(b"not sqlite")
             self.write_config(
                 home / ".codex",
-                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
+                '[model_providers.arbitrary]\nbase_url = "https://portdan.com/v1"\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
             )
             self.assertEqual(self.resolve(home), KEY)
 
-    def test_inline_portdan_token_needs_no_model_provider_model_or_wire_api(self) -> None:
+    def test_inline_key_needs_no_portdan_provider_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_config(
                 home / ".codex",
-                '[model_providers.portdan]\n'
+                '[model_providers.customer_alias]\n'
+                'base_url = "https://portdan.com/v1/responses"\n'
                 'experimental_bearer_token = "{}"\n'.format(KEY),
             )
             self.assertEqual(self.resolve(home), KEY)
+
+    def test_codex_provider_explicit_inline_key_aliases_are_supported(self) -> None:
+        for field_name in generate_image.PROVIDER_KEY_FIELDS:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp)
+                self.write_config(
+                    home / ".codex",
+                    '[model_providers.customer_alias]\n'
+                    'base_url = "https://portdan.com/v1/responses"\n'
+                    '{} = "{}"\n'.format(field_name, KEY),
+                )
+                request_config = self.resolve_request(home)
+                self.assertEqual(request_config.api_key, KEY)
+                self.assertEqual(request_config.source, generate_image.KEY_SOURCE_DEFAULT)
 
     def test_inline_portdan_token_does_not_read_auth_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_config(
                 home / ".codex",
-                '[model_providers.portdan]\n'
+                '[model_providers.customer_alias]\n'
+                'base_url = "https://portdan.com"\n'
                 'experimental_bearer_token = "{}"\n'.format(KEY),
                 {"OPENAI_API_KEY": OTHER_KEY},
             )
@@ -248,9 +546,11 @@ class GenerateImageTests(unittest.TestCase):
             home = Path(temp)
             self.write_config(
                 home / ".codex",
-                'model_provider = "portdan"\n'
-                '[model_providers.portdan]\nrequires_openai_auth = true\n'
+                'model_provider = "paid_group"\n'
+                '[model_providers.paid_group]\nbase_url = "https://portdan.com/v1"\n'
+                'requires_openai_auth = true\n'
                 '[model_providers.portdan_backup]\n'
+                'base_url = "https://portdan.com/v1"\n'
                 'experimental_bearer_token = "{}"\n'.format(OTHER_KEY),
                 {"OPENAI_API_KEY": KEY},
             )
@@ -279,12 +579,26 @@ class GenerateImageTests(unittest.TestCase):
             self.assertEqual(self.resolve(home), KEY)
             self.assertEqual(self.resolve_request(home).model, MODEL)
 
+    def test_codex_auth_json_explicit_key_aliases_are_supported(self) -> None:
+        for field_name in generate_image.PROVIDER_KEY_FIELDS:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp:
+                home = Path(temp)
+                self.write_config(
+                    home / ".codex",
+                    'openai_base_url = "https://portdan.com/v1/responses"\n',
+                    {field_name: KEY},
+                )
+                request_config = self.resolve_request(home)
+                self.assertEqual(request_config.api_key, KEY)
+                self.assertEqual(request_config.source, generate_image.KEY_SOURCE_DEFAULT)
+
     def test_requires_openai_auth_provider_uses_auth_json_api_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_config(
                 home / ".codex",
-                'model_provider = "portdan"\n[model_providers.portdan]\n'
+                'model_provider = "my_provider"\n[model_providers.my_provider]\n'
+                'base_url = "https://portdan.com/v1/responses"\n'
                 'requires_openai_auth = true\n',
                 {"OPENAI_API_KEY": KEY},
             )
@@ -314,7 +628,7 @@ class GenerateImageTests(unittest.TestCase):
             )
             self.assertEqual(self.resolve(home, {"PORTDAN_API_KEY": KEY}), KEY)
 
-    def test_backup_portdan_key_does_not_inherit_active_foreign_model(self) -> None:
+    def test_active_foreign_provider_does_not_use_backup_portdan_key(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
             self.write_config(
@@ -324,13 +638,11 @@ class GenerateImageTests(unittest.TestCase):
                 '[model_providers.foreign]\n'
                 'base_url = "https://api.example.com/v1"\n'
                 '[model_providers.portdan_backup]\n'
+                'base_url = "https://portdan.com/v1"\n'
                 'experimental_bearer_token = "{}"\n'.format(KEY),
             )
-            request_config = self.resolve_request(home)
-            self.assertEqual(request_config.api_key, KEY)
-            self.assertEqual(
-                request_config.model, generate_image.DEFAULT_RESPONSE_MODEL
-            )
+            with self.assertRaises(generate_image.ConfigError):
+                self.resolve(home)
 
     def test_provider_env_key_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -375,12 +687,14 @@ class GenerateImageTests(unittest.TestCase):
             )
             self.write_config(
                 installed,
-                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
+                '[model_providers.local_alias]\nbase_url = "https://portdan.com/v1"\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
             )
             code_home = root / "code-home"
             self.write_config(
                 code_home,
-                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(
+                '[model_providers.local_alias]\nbase_url = "https://portdan.com/v1"\n'
+                'experimental_bearer_token = "{}"\n'.format(
                     OTHER_KEY
                 ),
             )
@@ -399,7 +713,8 @@ class GenerateImageTests(unittest.TestCase):
             script = installed / "skills" / "portdan-image2" / "scripts" / "generate_image.py"
             self.write_config(
                 installed,
-                '[model_providers.portdan]\nexperimental_bearer_token = "{}"\n'.format(KEY),
+                '[model_providers.local_alias]\nbase_url = "https://portdan.com/v1"\n'
+                'experimental_bearer_token = "{}"\n'.format(KEY),
             )
             with patch.object(generate_image, "__file__", str(script)), patch.object(
                 generate_image, "_custom_codex_root"
@@ -465,10 +780,11 @@ class GenerateImageTests(unittest.TestCase):
     def test_portdan_api_key_environment_is_final_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(self.resolve(Path(temp), {"PORTDAN_API_KEY": KEY}), KEY)
-            self.assertEqual(
-                self.resolve_request(Path(temp), {"PORTDAN_API_KEY": KEY}).model,
-                generate_image.DEFAULT_RESPONSE_MODEL,
+            request_config = self.resolve_request(
+                Path(temp), {"PORTDAN_API_KEY": KEY}
             )
+            self.assertEqual(request_config.model, generate_image.DEFAULT_RESPONSE_MODEL)
+            self.assertEqual(request_config.source, generate_image.KEY_SOURCE_ENV)
 
     def test_non_portdan_auth_json_is_not_used(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -506,6 +822,32 @@ class GenerateImageTests(unittest.TestCase):
             generate_image._key_from_config(parsed, {"OPENAI_API_KEY": KEY}, {}), KEY
         )
 
+    def test_python39_fallback_supports_dotted_provider_key_aliases(self) -> None:
+        config = (
+            'model_provider = "customer_alias"\n'
+            'model_providers.customer_alias.base_url = "https://portdan.com/v1/responses"\n'
+            'model_providers.customer_alias.apiKey = "{}"\n'.format(KEY)
+        )
+        with patch.object(generate_image, "tomllib", None):
+            parsed = generate_image._parse_config(config.encode("utf-8"))
+        request_config = generate_image._request_config_from_config(parsed, None, {})
+        self.assertIsNotNone(request_config)
+        assert request_config is not None
+        self.assertEqual(request_config.api_key, KEY)
+
+    def test_python39_fallback_supports_quoted_dotted_provider_key_aliases(self) -> None:
+        config = (
+            'model_provider = "customer alias"\n'
+            'model_providers."customer alias".base_url = "https://portdan.com/v1"\n'
+            'model_providers."customer alias".apiKey = "{}"\n'.format(KEY)
+        )
+        with patch.object(generate_image, "tomllib", None):
+            parsed = generate_image._parse_config(config.encode("utf-8"))
+        request_config = generate_image._request_config_from_config(parsed, None, {})
+        self.assertIsNotNone(request_config)
+        assert request_config is not None
+        self.assertEqual(request_config.api_key, KEY)
+
     def test_missing_key_returns_one_actionable_message_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -513,13 +855,179 @@ class GenerateImageTests(unittest.TestCase):
             with patch.object(Path, "home", return_value=home), patch.dict(
                 os.environ, {}, clear=True
             ), patch.object(generate_image, "_post") as post, patch.object(
+                Path, "cwd", return_value=home
+            ), patch.object(
                 sys, "stdin", io.StringIO("a dog")
             ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = generate_image.main(["--prompt-stdin", "--quality", "low"])
             self.assertEqual(code, 2)
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(stderr.getvalue().strip(), generate_image.MISSING_KEY_MESSAGE)
+            self.assertIn("没有发送", stderr.getvalue())
+            self.assertFalse((home / "portdan-images").exists())
             post.assert_not_called()
+
+    def test_api_key_stdin_overrides_automatic_key_for_one_process_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            self.write_cc_database(
+                home,
+                'openai_base_url = "https://portdan.com/v1"\n',
+                {"OPENAI_API_KEY": OTHER_KEY},
+            )
+            stdout, stderr = io.StringIO(), io.StringIO()
+            observed: list[tuple[str, str | None]] = []
+            request_configs: list[generate_image.RequestConfig] = []
+            original_payload = generate_image._payload
+
+            def payload(
+                request_config: generate_image.RequestConfig,
+                prompt: str,
+                size: str,
+                quality: str,
+            ) -> bytes:
+                request_configs.append(request_config)
+                return original_payload(request_config, prompt, size, quality)
+
+            def post(api_key: str, _body: bytes, _timeout: float) -> bytes:
+                observed.append((api_key, os.environ.get("PORTDAN_API_KEY")))
+                return response_body()
+
+            with patch.object(Path, "home", return_value=home), patch.object(
+                Path, "cwd", return_value=home
+            ), patch.dict(
+                os.environ, {"PORTDAN_API_KEY": OTHER_KEY}, clear=True
+            ), patch.object(
+                generate_image,
+                "resolve_request_config",
+                return_value=generate_image.RequestConfig(
+                    api_key=OTHER_KEY,
+                    model=MODEL,
+                    source=generate_image.KEY_SOURCE_CC_SWITCH,
+                ),
+            ) as resolve, patch.object(
+                generate_image, "_payload", side_effect=payload
+            ), patch.object(
+                generate_image, "_post", side_effect=post
+            ) as post_mock, patch.object(
+                sys, "stdin", io.StringIO("a dog\n{}\n".format(KEY))
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = generate_image.main([
+                    "--api-key-stdin", "--size", "1024x1024", "--quality", "low"
+                ])
+                restored_value = os.environ.get("PORTDAN_API_KEY")
+
+            self.assertEqual(code, 0)
+            resolve.assert_called_once()
+            post_mock.assert_called_once()
+            self.assertEqual(observed, [(KEY, KEY)])
+            self.assertEqual(restored_value, OTHER_KEY)
+            self.assertEqual(len(request_configs), 1)
+            self.assertEqual(request_configs[0].api_key, KEY)
+            self.assertEqual(request_configs[0].model, MODEL)
+            self.assertEqual(request_configs[0].source, generate_image.KEY_SOURCE_STDIN)
+            self.assertNotIn(KEY, repr(request_configs[0]))
+            combined_output = stdout.getvalue() + stderr.getvalue()
+            self.assertNotIn(KEY, combined_output)
+            self.assertNotIn(OTHER_KEY, combined_output)
+            self.assertIn("本次提供", stderr.getvalue())
+            output = Path(stdout.getvalue().strip())
+            self.assertEqual(output.read_bytes(), PNG)
+
+    def test_api_key_stdin_restores_missing_environment_after_failure(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        failure = generate_image.RequestError(503, kind="http", response_started=True)
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            generate_image, "_post", side_effect=failure
+        ) as post, patch.object(
+            sys, "stdin", io.StringIO("a dog\n{}\n".format(KEY))
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = generate_image.main(["--api-key-stdin", "--quality", "medium"])
+            key_remains = "PORTDAN_API_KEY" in os.environ
+        self.assertEqual(code, 4)
+        post.assert_called_once()
+        self.assertFalse(key_remains)
+        self.assertNotIn(KEY, stdout.getvalue() + stderr.getvalue())
+
+    def test_api_key_stdin_rejects_tty_missing_empty_and_invalid_key_without_request(self) -> None:
+        cases = (
+            ("tty", TtyInput("a dog\n{}\n".format(KEY))),
+            ("unverifiable-tty", UnverifiableTtyInput("a dog\n{}\n".format(KEY))),
+            ("missing", io.StringIO("a dog\n")),
+            ("empty", io.StringIO("a dog\n\n")),
+            ("invalid", io.StringIO("a dog\n{} invalid\n".format(KEY))),
+        )
+        for label, stdin in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.dict(
+                    os.environ, {"PORTDAN_API_KEY": OTHER_KEY}, clear=True
+                ), patch.object(
+                    Path, "cwd", return_value=directory
+                ), patch.object(
+                    generate_image, "resolve_request_config"
+                ) as resolve, patch.object(
+                    generate_image, "_post"
+                ) as post, patch.object(
+                    sys, "stdin", stdin
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = generate_image.main(["--api-key-stdin", "--quality", "low"])
+                    restored_value = os.environ.get("PORTDAN_API_KEY")
+                self.assertEqual(code, 2)
+                resolve.assert_not_called()
+                post.assert_not_called()
+                self.assertEqual(restored_value, OTHER_KEY)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("没有发送", stderr.getvalue())
+                self.assertNotIn(KEY, stderr.getvalue())
+                self.assertNotIn(OTHER_KEY, stderr.getvalue())
+                self.assertFalse((directory / "portdan-images").exists())
+
+    def test_api_key_stdin_does_not_modify_config_profiles_or_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            protected = (
+                home / ".codex" / "config.toml",
+                home / ".codex" / "auth.json",
+                home / ".cc-switch" / "settings.json",
+                home / ".zshrc",
+                home / ".bash_profile",
+                home / ".config" / "powershell" / "Microsoft.PowerShell_profile.ps1",
+                home / "runner.log",
+            )
+            for index, path in enumerate(protected):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("sentinel-{}\n".format(index), encoding="utf-8")
+            before_hashes = {
+                path: hashlib.sha256(path.read_bytes()).hexdigest() for path in protected
+            }
+            before_files = {path.relative_to(home) for path in home.rglob("*") if path.is_file()}
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(Path, "home", return_value=home), patch.object(
+                Path, "cwd", return_value=home
+            ), patch.dict(os.environ, {}, clear=True), patch.object(
+                generate_image, "_post", return_value=response_body()
+            ) as post, patch.object(
+                sys, "stdin", io.StringIO("a dog\n{}\n".format(KEY))
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = generate_image.main(["--api-key-stdin", "--quality", "low"])
+                key_remains = "PORTDAN_API_KEY" in os.environ
+
+            self.assertEqual(code, 0)
+            post.assert_called_once()
+            self.assertFalse(key_remains)
+            for path, before_hash in before_hashes.items():
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before_hash)
+            new_files = {
+                path.relative_to(home) for path in home.rglob("*") if path.is_file()
+            } - before_files
+            self.assertEqual(len(new_files), 1)
+            self.assertEqual(next(iter(new_files)).parts[0], "portdan-images")
+            for path in home.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(KEY.encode(), path.read_bytes())
+            self.assertNotIn(KEY, stdout.getvalue() + stderr.getvalue())
 
     def test_payload_uses_responses_image_tool_and_all_quality_levels(self) -> None:
         self.assertEqual(generate_image.ENDPOINT, "https://portdan.com/v1/responses")
@@ -652,6 +1160,138 @@ class GenerateImageTests(unittest.TestCase):
         )
         self.assertEqual(proxy.proxies, {})
 
+    def test_post_classifies_transport_failures_without_retry(self) -> None:
+        scenarios = (
+            (
+                "dns",
+                generate_image.URLError(
+                    socket.gaierror(socket.EAI_NONAME, "name resolution failed")
+                ),
+            ),
+            ("tls", generate_image.URLError(ssl.SSLError("handshake failed"))),
+            (
+                "connect",
+                generate_image.URLError(
+                    ConnectionRefusedError(errno.ECONNREFUSED, "connection refused")
+                ),
+            ),
+            ("timeout", socket.timeout("connect timed out")),
+            ("connect", http.client.BadStatusLine("bad HTTP status")),
+        )
+        for expected_kind, failure in scenarios:
+            with self.subTest(kind=expected_kind):
+                opener = Mock()
+                opener.open.side_effect = failure
+                with patch.object(
+                    generate_image, "build_opener", return_value=opener
+                ), self.assertRaises(generate_image.RequestError) as raised:
+                    generate_image._post(KEY, b"{}", 1)
+                self.assertEqual(raised.exception.status, 0)
+                self.assertEqual(raised.exception.kind, expected_kind)
+                self.assertFalse(raised.exception.response_started)
+                self.assertIsNone(raised.exception.request_id)
+                self.assertNotIn(KEY, repr(raised.exception))
+                opener.open.assert_called_once()
+
+    def test_post_classifies_failures_after_response_headers_without_retry(self) -> None:
+        class Response:
+            status = 200
+
+            def __init__(self, failure: BaseException) -> None:
+                self.failure = failure
+                self.headers = Message()
+                self.headers["X-Request-ID"] = "req-safe-123"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _limit):
+                raise self.failure
+
+        scenarios = (
+            ("response_timeout", socket.timeout("body timed out")),
+            ("connect", ConnectionResetError(errno.ECONNRESET, "connection reset")),
+            ("connect", ssl.SSLError("response TLS failure")),
+            ("connect", http.client.IncompleteRead(b"partial", 10)),
+        )
+        for expected_kind, failure in scenarios:
+            with self.subTest(kind=expected_kind):
+                opener = Mock()
+                opener.open.return_value = Response(failure)
+                with patch.object(
+                    generate_image, "build_opener", return_value=opener
+                ), self.assertRaises(generate_image.RequestError) as raised:
+                    generate_image._post(KEY, b"{}", 1)
+                self.assertEqual(raised.exception.status, 200)
+                self.assertEqual(raised.exception.kind, expected_kind)
+                self.assertTrue(raised.exception.response_started)
+                self.assertEqual(raised.exception.request_id, "req-safe-123")
+                opener.open.assert_called_once()
+
+    def test_post_classifies_http_auth_and_server_errors_with_safe_request_id(self) -> None:
+        for status in (401, 403, 503):
+            with self.subTest(status=status):
+                headers = Message()
+                headers["X-Request-ID"] = "req-safe-{}".format(status)
+                headers["Authorization"] = "Bearer " + KEY
+                failure = generate_image.HTTPError(
+                    generate_image.ENDPOINT,
+                    status,
+                    "request failed",
+                    headers,
+                    io.BytesIO(b"ignored error body"),
+                )
+                opener = Mock()
+                opener.open.side_effect = failure
+                with patch.object(
+                    generate_image, "build_opener", return_value=opener
+                ), self.assertRaises(generate_image.RequestError) as raised:
+                    generate_image._post(KEY, b"{}", 1)
+                self.assertEqual(raised.exception.status, status)
+                self.assertEqual(raised.exception.kind, "http")
+                self.assertTrue(raised.exception.response_started)
+                self.assertEqual(
+                    raised.exception.request_id, "req-safe-{}".format(status)
+                )
+                self.assertNotIn(KEY, repr(raised.exception))
+                opener.open.assert_called_once()
+
+    def test_post_classifies_oversized_success_response_without_claiming_rejection(self) -> None:
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def getcode(self):
+                return self.status
+
+            def read(self, _limit):
+                return b"too-large"
+
+        opener = Mock()
+        opener.open.return_value = Response()
+        with patch.object(generate_image, "build_opener", return_value=opener), patch.object(
+            generate_image, "MAX_RESPONSE_BYTES", 1
+        ), self.assertRaises(generate_image.RequestError) as raised:
+            generate_image._post(KEY, b"{}", 1)
+        self.assertEqual(raised.exception.status, 200)
+        self.assertEqual(raised.exception.kind, "response_too_large")
+        message = generate_image._error_message(raised.exception)
+        self.assertIn("超过安全大小限制", message)
+        self.assertNotIn("拒绝", message)
+        self.assertNotIn("HTTP 200", message)
+        opener.open.assert_called_once()
+
     def test_post_opens_the_fixed_responses_endpoint_exactly_once(self) -> None:
         class Response:
             status = 200
@@ -715,6 +1355,67 @@ class GenerateImageTests(unittest.TestCase):
             self.assertEqual(post.call_count, 1)
             self.assertIn(code, (3, 4))
 
+    def test_user_key_auth_transport_and_server_failures_submit_only_once(self) -> None:
+        scenarios = (
+            (generate_image.RequestError(401, kind="http", response_started=True), 3),
+            (generate_image.RequestError(403, kind="http", response_started=True), 3),
+            (generate_image.RequestError(0, kind="dns"), 4),
+            (generate_image.RequestError(0, kind="tls"), 4),
+            (generate_image.RequestError(0, kind="connect"), 4),
+            (generate_image.RequestError(0, kind="timeout"), 4),
+            (
+                generate_image.RequestError(
+                    0, kind="response_timeout", response_started=True
+                ),
+                4,
+            ),
+            (generate_image.RequestError(503, kind="http", response_started=True), 4),
+        )
+        for failure, expected_code in scenarios:
+            with self.subTest(kind=failure.kind, status=failure.status):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                    generate_image, "_post", side_effect=failure
+                ) as post, patch.object(
+                    sys, "stdin", io.StringIO("a dog\n{}\n".format(KEY))
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = generate_image.main([
+                        "--api-key-stdin", "--quality", "high"
+                    ])
+                    key_remains = "PORTDAN_API_KEY" in os.environ
+                self.assertEqual(code, expected_code)
+                post.assert_called_once()
+                self.assertFalse(key_remains)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(KEY, stderr.getvalue())
+
+    def test_transport_and_server_messages_are_classified_without_legacy_guess(self) -> None:
+        failures = {
+            "dns": generate_image.RequestError(0, kind="dns"),
+            "tls": generate_image.RequestError(0, kind="tls"),
+            "connect": generate_image.RequestError(0, kind="connect"),
+            "timeout": generate_image.RequestError(0, kind="timeout"),
+            "response_timeout": generate_image.RequestError(
+                0, kind="response_timeout", response_started=True
+            ),
+            "server": generate_image.RequestError(
+                503, kind="http", response_started=True, request_id="req-safe-503"
+            ),
+        }
+        messages = {
+            name: generate_image._error_message(failure)
+            for name, failure in failures.items()
+        }
+        self.assertIn("域名解析", messages["dns"])
+        self.assertIn("TLS", messages["tls"])
+        self.assertIn("连接", messages["connect"])
+        self.assertIn("超时", messages["timeout"])
+        self.assertIn("超时", messages["response_timeout"])
+        self.assertIn("503", messages["server"])
+        self.assertIn("req-safe-503", messages["server"])
+        for message in messages.values():
+            self.assertNotIn("可能已经到达后台", message)
+
     def test_key_never_appears_in_cli_failure_output(self) -> None:
         request_config = generate_image.RequestConfig(api_key=KEY, model=MODEL)
         scenarios = (
@@ -739,7 +1440,7 @@ class GenerateImageTests(unittest.TestCase):
 
     def test_404_message_is_factual_and_does_not_guess_channel_state(self) -> None:
         message = generate_image._error_message(generate_image.RequestError(404))
-        self.assertEqual(message, "Portdan 返回 404，图片请求未完成")
+        self.assertTrue(message.startswith("Portdan 返回 404，图片请求未完成"))
         self.assertNotIn("图片通道", message)
 
     def test_main_does_not_modify_codex_configuration(self) -> None:

@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import errno
+import http.client
 import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
+import ssl
 import stat
 import sys
 import time
@@ -32,27 +36,78 @@ HOST = "portdan.com"
 ENDPOINT = "https://portdan.com/v1/responses"
 IMAGE_MODEL = "gpt-image-2"
 DEFAULT_RESPONSE_MODEL = "gpt-5.4-mini"
-MISSING_KEY_MESSAGE = "未找到 Portdan API Key，请先在 CC Switch 中选择 Portdan，或设置 PORTDAN_API_KEY"
+MISSING_KEY_MESSAGE = (
+    "未读取到可用于 Portdan 的 API Key；本次没有发送图片请求。"
+    "请检查当前 CC Switch Codex provider、设置 PORTDAN_API_KEY，或为本次请求提供 Key"
+)
+PROVIDED_KEY_MESSAGE = "提供的 API Key 无效；本次没有发送图片请求"
 SIZES = ("1024x1024", "1536x1024", "1024x1536")
 QUALITIES = ("low", "medium", "high")
 QUALITY_LABELS = {"low": "快速", "medium": "均衡", "high": "高清"}
+KEY_SOURCE_CC_SWITCH = "cc_switch_current_provider"
+KEY_SOURCE_INSTALLED = "installed_codex_config"
+KEY_SOURCE_CODEX_HOME = "codex_home"
+KEY_SOURCE_CC_SWITCH_CONFIG = "cc_switch_config_dir"
+KEY_SOURCE_DEFAULT = "default_codex_config"
+KEY_SOURCE_ENV = "portdan_api_key_env"
+KEY_SOURCE_STDIN = "provided_stdin"
+AUTH_KEY_FIELDS = ("OPENAI_API_KEY", "CODEX_API_KEY", "API_KEY", "api_key", "apiKey")
+PROVIDER_KEY_FIELDS = AUTH_KEY_FIELDS + ("experimental_bearer_token",)
+PROVIDER_CONFIG_FIELDS = PROVIDER_KEY_FIELDS + (
+    "base_url",
+    "wire_api",
+    "env_key",
+    "requires_openai_auth",
+)
+KEY_SOURCE_LABELS = {
+    KEY_SOURCE_CC_SWITCH: "CC Switch 当前 Codex provider",
+    KEY_SOURCE_INSTALLED: "已安装 Skill 所在 Codex 配置",
+    KEY_SOURCE_CODEX_HOME: "CODEX_HOME",
+    KEY_SOURCE_CC_SWITCH_CONFIG: "CC Switch codexConfigDir",
+    KEY_SOURCE_DEFAULT: "~/.codex",
+    KEY_SOURCE_ENV: "PORTDAN_API_KEY 环境变量",
+    KEY_SOURCE_STDIN: "本次提供的 Key",
+    "unknown": "未知来源",
+}
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_SETTINGS_BYTES = 512 * 1024
 MAX_PROMPT_CHARS = 20_000
 MAX_PROMPT_BYTES = 80_000
+MAX_KEY_BYTES = 8192
 MAX_RESPONSE_BYTES = 96 * 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_PIXELS = 4_000_000
 CC_SWITCH_DB_TIMEOUT_SECONDS = 0.2
+REQUEST_ID_HEADERS = (
+    "x-request-id",
+    "request-id",
+    "openai-request-id",
+    "x-portdan-request-id",
+)
+MAX_REQUEST_ID_CHARS = 200
 
 
 class ConfigError(RuntimeError):
     pass
 
 
+class ProvidedKeyError(ValueError):
+    pass
+
+
 class RequestError(RuntimeError):
-    def __init__(self, status: int = 0) -> None:
+    def __init__(
+        self,
+        status: int = 0,
+        *,
+        kind: Optional[str] = None,
+        response_started: bool = False,
+        request_id: Optional[str] = None,
+    ) -> None:
         self.status = status
+        self.kind = kind or ("http" if status else "transport")
+        self.response_started = response_started
+        self.request_id = request_id
         super().__init__(str(status))
 
 
@@ -70,6 +125,7 @@ class OutputRecoveryError(RuntimeError):
 class RequestConfig:
     api_key: str = field(repr=False)
     model: str = DEFAULT_RESPONSE_MODEL
+    source: str = "unknown"
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -171,26 +227,24 @@ def _fallback_toml(text: str) -> Dict[str, Any]:
             continue
         key, raw = line.split("=", 1)
         key = key.strip()
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
-            continue
-        value = _toml_value(raw)
         dotted = re.fullmatch(
-            r"model_providers\.([A-Za-z0-9_-]+)\."
-            r"(base_url|wire_api|experimental_bearer_token|env_key|requires_openai_auth)",
+            r'model_providers\.(?:"([^"\\]+)"|\'([^\'\\]+)\'|([A-Za-z0-9_-]+))\.'
+            r"([A-Za-z0-9_-]+)",
             key,
         )
         if dotted:
-            providers.setdefault(dotted.group(1), {})[dotted.group(2)] = value
-        elif current is None:
+            provider_name = next(value for value in dotted.groups()[:3] if value is not None)
+            field_name = dotted.group(4)
+            if field_name in PROVIDER_CONFIG_FIELDS:
+                providers.setdefault(provider_name, {})[field_name] = _toml_value(raw)
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            continue
+        value = _toml_value(raw)
+        if current is None:
             if key in ("model", "model_provider", "openai_base_url"):
                 top[key] = value
-        elif key in (
-            "base_url",
-            "wire_api",
-            "experimental_bearer_token",
-            "env_key",
-            "requires_openai_auth",
-        ):
+        elif key in PROVIDER_CONFIG_FIELDS:
             providers[current][key] = value
     top["model_providers"] = providers
     return top
@@ -214,10 +268,10 @@ def _parse_config(raw: bytes) -> Dict[str, Any]:
 
 
 def _is_portdan_url(base_url: Any) -> bool:
-    if not isinstance(base_url, str):
+    if not isinstance(base_url, str) or base_url != base_url.strip():
         return False
     try:
-        parsed = urlsplit(base_url.strip())
+        parsed = urlsplit(base_url)
         port = parsed.port
     except (TypeError, ValueError, AttributeError):
         return False
@@ -229,7 +283,17 @@ def _is_portdan_url(base_url: Any) -> bool:
         or port not in (None, 443)
         or parsed.query
         or parsed.fragment
-        or parsed.path.rstrip("/") not in ("", "/v1", "/backend-api/codex")
+        or parsed.path
+        not in (
+            "",
+            "/",
+            "/v1",
+            "/v1/",
+            "/v1/responses",
+            "/v1/responses/",
+            "/backend-api/codex",
+            "/backend-api/codex/",
+        )
     )
 
 
@@ -239,7 +303,15 @@ def _key(value: Any) -> str:
     result = value.strip()
     if result.lower().startswith("bearer "):
         result = result[7:].strip()
-    if not result or len(result) > 8192 or any(ord(c) < 32 or c.isspace() for c in result):
+    try:
+        encoded_length = len(result.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ConfigError() from exc
+    if (
+        not result
+        or encoded_length > MAX_KEY_BYTES
+        or any(ord(c) < 32 or c.isspace() for c in result)
+    ):
         raise ConfigError()
     return result
 
@@ -267,7 +339,11 @@ def _auth_key(auth: Any) -> Optional[str]:
     payload = _json_object(auth)
     if payload is None:
         return None
-    return _maybe_key(payload.get("OPENAI_API_KEY"))
+    for field_name in PROVIDER_KEY_FIELDS:
+        key = _maybe_key(payload.get(field_name))
+        if key:
+            return key
+    return None
 
 
 def _configured_model(config: Any) -> str:
@@ -306,8 +382,8 @@ def _configured_providers(config: Dict[str, Any]) -> list[tuple[str, Dict[str, A
     return result
 
 
-def _provider_is_portdan(name: str, provider: Dict[str, Any]) -> bool:
-    return "portdan" in name.casefold() or _is_portdan_url(provider.get("base_url"))
+def _provider_is_portdan(provider: Dict[str, Any]) -> bool:
+    return _is_portdan_url(provider.get("base_url"))
 
 
 def _top_level_portdan_applies(
@@ -321,7 +397,7 @@ def _top_level_portdan_applies(
     active_provider = next(
         ((name, provider) for name, provider in providers if name == active), None
     )
-    return active_provider is None or _provider_is_portdan(*active_provider)
+    return active_provider is None or _provider_is_portdan(active_provider[1])
 
 
 def _config_auth_allowed(config: Dict[str, Any], providers: list[tuple[str, Dict[str, Any]]]) -> bool:
@@ -332,17 +408,18 @@ def _config_auth_allowed(config: Dict[str, Any], providers: list[tuple[str, Dict
         active_provider = next(
             ((name, provider) for name, provider in providers if name == active), None
         )
-        if active_provider is not None and _provider_is_portdan(*active_provider):
+        if active_provider is not None and _provider_is_portdan(active_provider[1]):
             return True
-    return len(providers) == 1 and _provider_is_portdan(*providers[0])
+    return len(providers) == 1 and _provider_is_portdan(providers[0][1])
 
 
 def _key_from_provider(
     provider: Dict[str, Any], environ: Mapping[str, str]
 ) -> Optional[str]:
-    inline = _maybe_key(provider.get("experimental_bearer_token"))
-    if inline:
-        return inline
+    for field_name in PROVIDER_KEY_FIELDS:
+        inline = _maybe_key(provider.get(field_name))
+        if inline:
+            return inline
     env_name = provider.get("env_key")
     if isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name):
         return _maybe_key(environ.get(env_name))
@@ -357,7 +434,10 @@ def _key_from_config(
 
 
 def _request_config_from_config(
-    config: Dict[str, Any], auth: Any, environ: Mapping[str, str]
+    config: Dict[str, Any],
+    auth: Any,
+    environ: Mapping[str, str],
+    source: str = KEY_SOURCE_DEFAULT,
 ) -> Optional[RequestConfig]:
     providers = _configured_providers(config)
     model = _configured_model(config)
@@ -366,30 +446,36 @@ def _request_config_from_config(
         (
             (name, provider)
             for name, provider in providers
-            if isinstance(active, str) and name == active and _provider_is_portdan(name, provider)
+            if isinstance(active, str) and name == active
         ),
         None,
     )
     if active_provider is not None:
         _, provider = active_provider
+        if not _provider_is_portdan(provider):
+            return None
         direct = _key_from_provider(provider, environ)
         if direct:
-            return RequestConfig(api_key=direct, model=model)
+            return RequestConfig(api_key=direct, model=model, source=source)
         auth_key = _auth_key(auth)
         if auth_key:
-            return RequestConfig(api_key=auth_key, model=model)
+            return RequestConfig(api_key=auth_key, model=model, source=source)
+        return None
 
     top_level_portdan = _top_level_portdan_applies(config, providers)
     if top_level_portdan:
         auth_key = _auth_key(auth)
         if auth_key:
-            return RequestConfig(api_key=auth_key, model=model)
+            return RequestConfig(api_key=auth_key, model=model, source=source)
+
+    if isinstance(active, str):
+        return None
 
     candidates: set[str] = set()
     portdan_providers = [
         (name, provider)
         for name, provider in providers
-        if _provider_is_portdan(name, provider)
+        if _provider_is_portdan(provider)
     ]
     for _, provider in portdan_providers:
         direct = _key_from_provider(provider, environ)
@@ -401,11 +487,11 @@ def _request_config_from_config(
             if top_level_portdan or (len(providers) == 1 and len(portdan_providers) == 1)
             else DEFAULT_RESPONSE_MODEL
         )
-        return RequestConfig(api_key=next(iter(candidates)), model=selected_model)
+        return RequestConfig(api_key=next(iter(candidates)), model=selected_model, source=source)
     if len(providers) == 1 and len(portdan_providers) == 1:
         auth_key = _auth_key(auth)
         if auth_key:
-            return RequestConfig(api_key=auth_key, model=model)
+            return RequestConfig(api_key=auth_key, model=model, source=source)
     return None
 
 
@@ -418,7 +504,9 @@ def _read_auth(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _request_config_from_config_root(
-    root: Path, environ: Mapping[str, str]
+    root: Path,
+    environ: Mapping[str, str],
+    source: str = KEY_SOURCE_DEFAULT,
 ) -> Optional[RequestConfig]:
     try:
         config = _parse_config(_read_small_file(root / "config.toml", MAX_CONFIG_BYTES))
@@ -433,27 +521,51 @@ def _request_config_from_config_root(
             for name, provider in providers
             if isinstance(active, str)
             and name == active
-            and _provider_is_portdan(name, provider)
+            and _provider_is_portdan(provider)
         ),
         None,
     )
     if active_provider is not None:
         direct = _key_from_provider(active_provider, environ)
         if direct:
-            return RequestConfig(api_key=direct, model=model)
+            return RequestConfig(api_key=direct, model=model, source=source)
     elif not _top_level_portdan_applies(config, providers) and len(providers) == 1:
         name, provider = providers[0]
-        if _provider_is_portdan(name, provider):
+        if _provider_is_portdan(provider):
             direct = _key_from_provider(provider, environ)
             if direct:
-                return RequestConfig(api_key=direct, model=model)
+                return RequestConfig(api_key=direct, model=model, source=source)
     auth = _read_auth(root / "auth.json") if _config_auth_allowed(config, providers) else None
-    return _request_config_from_config(config, auth, environ)
+    return _request_config_from_config(config, auth, environ, source)
 
 
 def _key_from_config_root(root: Path, environ: Mapping[str, str]) -> Optional[str]:
     request_config = _request_config_from_config_root(root, environ)
     return request_config.api_key if request_config is not None else None
+
+
+def _cc_switch_settings(home: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _read_small_file(home / ".cc-switch" / "settings.json", MAX_SETTINGS_BYTES)
+        return _json_object(raw.decode("utf-8-sig"))
+    except (ConfigError, UnicodeDecodeError):
+        return None
+
+
+def _cc_switch_current_provider_id(home: Path) -> Optional[str]:
+    settings = _cc_switch_settings(home)
+    value = settings.get("currentProviderCodex") if settings else None
+    if not isinstance(value, str):
+        return None
+    provider_id = value
+    if (
+        not provider_id
+        or provider_id != provider_id.strip()
+        or len(provider_id) > 512
+        or any(ord(character) < 32 for character in provider_id)
+    ):
+        return None
+    return provider_id
 
 
 def _request_config_from_cc_switch_database(
@@ -479,16 +591,26 @@ def _request_config_from_cc_switch_database(
             for row in connection.execute("PRAGMA table_info(providers)").fetchall()
             if len(row) > 1
         }
-        if not {"settings_config", "app_type", "is_current"}.issubset(columns):
+        if not {"settings_config", "app_type"}.issubset(columns):
             return None
         identity_columns = [
-            name for name in ("name", "website_url", "provider_type") if name in columns
+            name for name in ("website_url", "provider_type") if name in columns
         ]
         selected = ", ".join(["settings_config"] + identity_columns)
-        rows = connection.execute(
-            "SELECT " + selected + " FROM providers "
-            "WHERE app_type = 'codex' AND is_current = 1 ORDER BY rowid DESC"
-        ).fetchall()
+        rows = []
+        current_provider_id = _cc_switch_current_provider_id(home)
+        if current_provider_id is not None and "id" in columns:
+            rows = connection.execute(
+                "SELECT " + selected + " FROM providers "
+                "WHERE app_type = 'codex' AND id = ? ORDER BY rowid DESC LIMIT 1",
+                (current_provider_id,),
+            ).fetchall()
+        if not rows and "is_current" in columns:
+            rows = connection.execute(
+                "SELECT " + selected + " FROM providers "
+                "WHERE app_type = 'codex' AND is_current = 1 "
+                "ORDER BY rowid DESC LIMIT 1"
+            ).fetchall()
     except sqlite3.Error:
         return None
     finally:
@@ -506,22 +628,25 @@ def _request_config_from_cc_switch_database(
                 config = None
         model = _configured_model(config)
         identity = dict(zip(identity_columns, row[1:]))
-        identity_is_portdan = (
-            isinstance(identity.get("name"), str)
-            and "portdan" in identity["name"].casefold()
-        ) or _is_portdan_url(identity.get("website_url"))
-        if identity_is_portdan:
-            key = _auth_key(settings.get("auth"))
-            if key:
-                return RequestConfig(api_key=key, model=model)
-        if config is not None and _config_auth_allowed(
+        identity_is_portdan = _is_portdan_url(identity.get("website_url"))
+        config_is_portdan = config is not None and _config_auth_allowed(
             config, _configured_providers(config)
-        ):
+        )
+        if identity_is_portdan or config_is_portdan:
             key = _auth_key(settings.get("auth"))
             if key:
-                return RequestConfig(api_key=key, model=model)
+                return RequestConfig(
+                    api_key=key,
+                    model=model,
+                    source=KEY_SOURCE_CC_SWITCH,
+                )
         if config is not None:
-            request_config = _request_config_from_config(config, None, environ)
+            request_config = _request_config_from_config(
+                config,
+                None,
+                environ,
+                KEY_SOURCE_CC_SWITCH,
+            )
             if request_config is not None:
                 return request_config
     return None
@@ -533,12 +658,7 @@ def _key_from_cc_switch_database(home: Path, environ: Mapping[str, str]) -> Opti
 
 
 def _custom_codex_root(home: Path) -> Optional[Path]:
-    try:
-        settings = _json_object(
-            _read_small_file(home / ".cc-switch" / "settings.json", MAX_SETTINGS_BYTES).decode("utf-8-sig")
-        )
-    except (ConfigError, UnicodeDecodeError):
-        return None
+    settings = _cc_switch_settings(home)
     custom = settings.get("codexConfigDir") if settings else None
     if not isinstance(custom, str) or not custom.strip():
         return None
@@ -547,7 +667,7 @@ def _custom_codex_root(home: Path) -> Optional[Path]:
 
 def _candidate_config_roots(
     home: Path, environ: Mapping[str, str]
-) -> Iterator[Path]:
+) -> Iterator[tuple[Path, str]]:
     seen: set[str] = set()
 
     def resolve(candidate: Path) -> Optional[Path]:
@@ -562,22 +682,22 @@ def _candidate_config_roots(
     if len(script.parents) > 3 and script.parents[2].name == "skills":
         installed = resolve(script.parents[3])
         if installed is not None:
-            yield installed
+            yield installed, KEY_SOURCE_INSTALLED
 
     codex_home = environ.get("CODEX_HOME")
     if codex_home:
         configured = resolve(Path(codex_home).expanduser())
         if configured is not None:
-            yield configured
+            yield configured, KEY_SOURCE_CODEX_HOME
 
     custom = _custom_codex_root(home)
     if custom is not None and str(custom) not in seen:
         seen.add(str(custom))
-        yield custom
+        yield custom, KEY_SOURCE_CC_SWITCH_CONFIG
 
     default = resolve(home / ".codex")
     if default is not None:
-        yield default
+        yield default, KEY_SOURCE_DEFAULT
 
 
 def resolve_request_config() -> RequestConfig:
@@ -586,13 +706,13 @@ def resolve_request_config() -> RequestConfig:
     request_config = _request_config_from_cc_switch_database(home, environ)
     if request_config is not None:
         return request_config
-    for root in _candidate_config_roots(home, environ):
-        request_config = _request_config_from_config_root(root, environ)
+    for root, source in _candidate_config_roots(home, environ):
+        request_config = _request_config_from_config_root(root, environ, source)
         if request_config is not None:
             return request_config
     key = _maybe_key(environ.get("PORTDAN_API_KEY"))
     if key:
-        return RequestConfig(api_key=key)
+        return RequestConfig(api_key=key, source=KEY_SOURCE_ENV)
     raise ConfigError()
 
 
@@ -619,6 +739,52 @@ def _payload(request_config: RequestConfig, prompt: str, size: str, quality: str
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def _request_id(headers: Any) -> Optional[str]:
+    if headers is None:
+        return None
+    for header_name in REQUEST_ID_HEADERS:
+        try:
+            value = headers.get(header_name)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not isinstance(value, str):
+            continue
+        request_id = value.strip()
+        if (
+            request_id
+            and len(request_id) <= MAX_REQUEST_ID_CHARS
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", request_id)
+        ):
+            return request_id
+    return None
+
+
+def _transport_error(
+    error: BaseException,
+    *,
+    response_started: bool,
+    status: int = 0,
+    request_id: Optional[str] = None,
+) -> RequestError:
+    reason: Any = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, (TimeoutError, socket.timeout)) or (
+        isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT
+    ):
+        kind = "response_timeout" if response_started else "timeout"
+    elif isinstance(reason, ssl.SSLError):
+        kind = "connect" if response_started else "tls"
+    elif isinstance(reason, socket.gaierror):
+        kind = "dns"
+    else:
+        kind = "connect"
+    return RequestError(
+        status,
+        kind=kind,
+        response_started=response_started,
+        request_id=request_id,
+    )
+
+
 def _post(api_key: str, body: bytes, timeout: float) -> bytes:
     request = Request(
         ENDPOINT,
@@ -632,16 +798,45 @@ def _post(api_key: str, body: bytes, timeout: float) -> bytes:
         },
     )
     opener = build_opener(ProxyHandler({}), _NoRedirect())
+    response_started = False
+    status = 0
+    request_id: Optional[str] = None
     try:
         with opener.open(request, timeout=timeout) as response:
+            response_started = True
             status = int(getattr(response, "status", response.getcode()))
+            request_id = _request_id(getattr(response, "headers", None))
             data = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
-        raise RequestError(int(exc.code)) from None
-    except (OSError, URLError, TimeoutError):
-        raise RequestError(0) from None
-    if len(data) > MAX_RESPONSE_BYTES or not 200 <= status < 300:
-        raise RequestError(status)
+        raise RequestError(
+            int(exc.code),
+            kind="http",
+            response_started=True,
+            request_id=_request_id(getattr(exc, "headers", None)),
+        ) from None
+    except RequestError:
+        raise
+    except (OSError, URLError, TimeoutError, http.client.HTTPException) as exc:
+        raise _transport_error(
+            exc,
+            response_started=response_started,
+            status=status,
+            request_id=request_id,
+        ) from None
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise RequestError(
+            status,
+            kind="response_too_large",
+            response_started=True,
+            request_id=request_id,
+        )
+    if not 200 <= status < 300:
+        raise RequestError(
+            status,
+            kind="http",
+            response_started=True,
+            request_id=request_id,
+        )
     return data
 
 
@@ -828,8 +1023,11 @@ def _unlink_owned(path: Path, identity: tuple[int, int]) -> None:
         path.unlink()
 
 
-def _prompt_from_stdin() -> str:
-    source = getattr(sys.stdin, "buffer", sys.stdin)
+def _stdin_source() -> Any:
+    return getattr(sys.stdin, "buffer", sys.stdin)
+
+
+def _prompt_from_source(source: Any) -> str:
     raw = source.readline(MAX_PROMPT_BYTES + 1)
     if isinstance(raw, bytes):
         try:
@@ -846,9 +1044,50 @@ def _prompt_from_stdin() -> str:
     return prompt
 
 
+def _prompt_from_stdin() -> str:
+    return _prompt_from_source(_stdin_source())
+
+
+def _prompt_and_key_from_stdin() -> tuple[str, str]:
+    try:
+        is_tty = bool(sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        raise ProvidedKeyError() from None
+    if is_tty:
+        raise ProvidedKeyError()
+    source = _stdin_source()
+    prompt = _prompt_from_source(source)
+    raw = source.readline(MAX_KEY_BYTES + 1)
+    if isinstance(raw, bytes):
+        if len(raw) > MAX_KEY_BYTES:
+            raise ProvidedKeyError()
+        try:
+            value = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProvidedKeyError() from exc
+    else:
+        value = str(raw)
+        try:
+            encoded_length = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ProvidedKeyError() from exc
+        if encoded_length > MAX_KEY_BYTES:
+            raise ProvidedKeyError()
+    try:
+        api_key = _key(value)
+    except ConfigError as exc:
+        raise ProvidedKeyError() from exc
+    return prompt, api_key
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate one Portdan gpt-image-2 PNG")
     parser.add_argument("--prompt-stdin", action="store_true", help="read the visual prompt from standard input")
+    parser.add_argument(
+        "--api-key-stdin",
+        action="store_true",
+        help="read the prompt and one-time API Key as two lines from non-TTY standard input",
+    )
     parser.add_argument("--size", choices=SIZES, default="1024x1024")
     parser.add_argument("--quality", choices=QUALITIES, default="medium")
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -856,30 +1095,78 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _error_message(error: RequestError) -> str:
-    if error.status in (401, 403):
-        return "Portdan 拒绝了认证或当前分组未授权图片请求"
-    if error.status == 429:
-        return "Portdan 当前限流，请稍后再试"
-    if error.status == 404:
-        return "Portdan 返回 404，图片请求未完成"
-    if error.status == 0 or error.status >= 500:
-        return "Portdan 请求失败；请求可能已经到达后台，请先检查 Portdan 记录后再决定是否重试"
-    return "Portdan 拒绝了图片请求"
+    if error.kind == "dns":
+        message = "Portdan 域名解析失败；未收到 HTTP 响应，本次未自动重试"
+    elif error.kind == "tls":
+        message = "与 Portdan 建立 TLS 连接失败；未收到 HTTP 响应，本次未自动重试"
+    elif error.kind == "timeout":
+        message = "等待 Portdan 响应超时；未收到 HTTP 响应，请求是否已受理未知，本次未自动重试"
+    elif error.kind == "response_timeout":
+        message = "已收到 Portdan HTTP 响应头，但读取响应正文超时；图片结果未知，本次未自动重试"
+    elif error.kind == "response_too_large":
+        message = "Portdan 返回的响应超过安全大小限制；图片未保存，本次未自动重试"
+    elif error.kind in ("connect", "transport"):
+        if error.response_started:
+            message = "已收到 Portdan HTTP 响应头，但连接在响应完成前中断；图片结果未知，本次未自动重试"
+        else:
+            message = "连接 Portdan 失败；未收到 HTTP 响应，请求是否已送达未知，本次未自动重试"
+    elif error.status in (401, 403):
+        message = "Portdan 拒绝了认证或当前分组未授权图片请求；本次未自动重试"
+    elif error.status == 429:
+        message = "Portdan 当前限流；本次未自动重试"
+    elif error.status == 404:
+        message = "Portdan 返回 404，图片请求未完成；本次未自动重试"
+    elif error.status >= 500:
+        message = "Portdan 返回 HTTP {}；图片结果未知，本次未自动重试".format(
+            error.status
+        )
+    else:
+        message = "Portdan 返回 HTTP {} 并拒绝了图片请求；本次未自动重试".format(
+            error.status
+        )
+    if error.request_id:
+        message += "；请求 ID：{}".format(error.request_id)
+    return message
+
+
+def _source_label(request_config: RequestConfig) -> str:
+    return KEY_SOURCE_LABELS.get(request_config.source, KEY_SOURCE_LABELS["unknown"])
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parser().parse_args(argv)
-    if not args.prompt_stdin or args.timeout <= 0:
+    if not (args.prompt_stdin or args.api_key_stdin) or args.timeout <= 0:
         print("图片提示词或超时时间无效", file=sys.stderr)
         return 2
+    environment_changed = False
+    previous_api_key: Optional[str] = None
+    had_previous_api_key = False
+    request_config: Optional[RequestConfig] = None
     try:
         started = time.monotonic()
-        prompt = _prompt_from_stdin()
-        request_config = resolve_request_config()
+        if args.api_key_stdin:
+            prompt, provided_api_key = _prompt_and_key_from_stdin()
+            had_previous_api_key = "PORTDAN_API_KEY" in os.environ
+            previous_api_key = os.environ.get("PORTDAN_API_KEY")
+            os.environ["PORTDAN_API_KEY"] = provided_api_key
+            environment_changed = True
+            try:
+                configured_model = resolve_request_config().model
+            except ConfigError:
+                configured_model = DEFAULT_RESPONSE_MODEL
+            request_config = RequestConfig(
+                api_key=provided_api_key,
+                model=configured_model,
+                source=KEY_SOURCE_STDIN,
+            )
+        else:
+            prompt = _prompt_from_stdin()
+            request_config = resolve_request_config()
         body = _payload(request_config, prompt, args.size, args.quality)
         print(
-            "正在通过 Portdan 调用 OpenAI gpt-image-2（{}）生成图片…".format(
-                QUALITY_LABELS[args.quality]
+            "正在通过 Portdan 调用 OpenAI gpt-image-2（{}）生成图片… Key 来源：{}".format(
+                QUALITY_LABELS[args.quality],
+                _source_label(request_config),
             ),
             file=sys.stderr,
             flush=True,
@@ -898,11 +1185,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ConfigError:
         print(MISSING_KEY_MESSAGE, file=sys.stderr)
         return 2
+    except ProvidedKeyError:
+        print(PROVIDED_KEY_MESSAGE, file=sys.stderr)
+        return 2
     except ValueError:
         print("图片提示词或超时时间无效", file=sys.stderr)
         return 2
     except RequestError as exc:
-        print(_error_message(exc), file=sys.stderr)
+        message = _error_message(exc)
+        if request_config is not None:
+            message += "；Key 来源：{}".format(_source_label(request_config))
+        print(message, file=sys.stderr)
         return 3 if exc.status in (401, 403) else 4
     except ResponseError:
         print("Portdan 返回的图片数据无效", file=sys.stderr)
@@ -913,6 +1206,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     except OSError:
         print("无法安全保存生成的图片", file=sys.stderr)
         return 6
+    finally:
+        if environment_changed:
+            if had_previous_api_key and previous_api_key is not None:
+                os.environ["PORTDAN_API_KEY"] = previous_api_key
+            elif had_previous_api_key:
+                os.environ["PORTDAN_API_KEY"] = ""
+            else:
+                os.environ.pop("PORTDAN_API_KEY", None)
 
 
 if __name__ == "__main__":

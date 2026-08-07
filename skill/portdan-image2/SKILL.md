@@ -6,7 +6,9 @@ description: >-
   user asks for Portdan image generation, Image2, gpt-image-2, or wants to use
   Portdan credits instead of the Codex/ChatGPT account image channel. Ask once
   for fast, balanced, or high quality when quality is not specified, then run
-  the bundled Python requester exactly once.
+  the bundled Python requester exactly once. If automatic Key lookup fails,
+  explain that no request was sent and offer a one-time Key through protected
+  stdin without echoing or persisting it.
 ---
 
 # Portdan Image2
@@ -40,7 +42,7 @@ account image channel instead of Portdan.
    keep important content in the crop-safe center.
 4. Detect Python 3.9+: on macOS/Linux try `python3`, then `python`; on Windows
    PowerShell try `py -3`, then `python`.
-5. Start the bundled runner exactly once as an interactive process:
+5. Start the bundled runner exactly once with non-TTY stdin:
 
 ```text
 <python-command> <this-skill>/scripts/generate_image.py --prompt-stdin --size <selected-size> --quality <low|medium|high>
@@ -68,7 +70,7 @@ the same Key; if it is missing or cannot use the image tool, it uses
    its absolute path. Say: `已通过 Portdan 调用 OpenAI gpt-image-2 生成` and
    include the runner's quality and elapsed time when available.
 
-## Key lookup
+## Key lookup and one-time fallback
 
 Let the runner find the Key. It checks, in order:
 
@@ -79,19 +81,49 @@ Let the runner find the Key. It checks, in order:
 5. `~/.codex`;
 6. `PORTDAN_API_KEY`.
 
-It supports CC Switch provider data, inline `experimental_bearer_token`,
-`env_key`, and Portdan `openai_base_url` / `requires_openai_auth` configurations
-that store `OPENAI_API_KEY` in `auth.json`. It does not require
-`model_provider`, `model`, `wire_api`, or a configurable Base URL, and it never
-prints or modifies a Key or configuration file.
+Provider and Key display names do not need to contain `Portdan`. The runner
+prefers CC Switch `settings.json.currentProviderCodex` to select the current
+Codex provider and uses `is_current` only as a compatibility fallback. It then
+verifies Portdan through the provider URL or the actual Codex TOML configuration.
 
-If no Key is found, return only:
+Only after Portdan is established, the runner accepts explicit credential
+fields `OPENAI_API_KEY`, `CODEX_API_KEY`, `API_KEY`, `api_key`, `apiKey`,
+`experimental_bearer_token`, and the environment variable named by `env_key`.
+It does not scan arbitrary strings or use OAuth/access/refresh token fields.
+The runner retains a safe source label for CC Switch, Codex configuration,
+`PORTDAN_API_KEY`, or a Key supplied for this invocation, but never prints the
+Key itself or modifies a configuration file.
+
+If automatic lookup fails, tell the user that no HTTP request was sent and
+therefore this failed attempt cannot incur image charges. Offer two choices:
+
+- Set `PORTDAN_API_KEY` in the local environment that launches Codex, then ask
+  to run again.
+- Explicitly provide a Key for this invocation only.
+
+Use this message without inventing additional setup requirements:
 
 ```text
-未找到 Portdan API Key，请先在 CC Switch 中选择 Portdan，或设置 PORTDAN_API_KEY
+未读取到可用于 Portdan 的 API Key；本次没有发送图片请求。你可以在本机设置 PORTDAN_API_KEY，也可提供仅用于本次调用的 Key。
 ```
 
-Do not ask the user to paste a Key into chat.
+If the user explicitly provides a one-time Key, start the runner one more time
+with non-TTY stdin and both flags:
+
+```text
+<python-command> <this-skill>/scripts/generate_image.py --prompt-stdin --api-key-stdin --size <selected-size> --quality <low|medium|high>
+```
+
+Send exactly two UTF-8 lines through the process stdin: the prepared prompt,
+then the Key. Do not put the Key in command arguments, an environment-variable
+assignment made by the assistant, a heredoc, a temporary file, shell history,
+logs, commentary, or the final answer. Do not echo, quote, summarize, or
+otherwise repeat it. The runner temporarily sets `PORTDAN_API_KEY` only in its
+own process and restores the previous value before exiting; it must not modify
+shell profiles, auth/config/settings files, or any other persistent state.
+
+Run this fallback at most once for the Key the user supplied. Missing, empty,
+invalid, or TTY-delivered Key input must stop before any HTTP request.
 
 ## Failures
 
@@ -102,8 +134,10 @@ Do not ask the user to paste a Key into chat.
 - 404: report only that Portdan returned 404 and the image request did not
   complete; do not guess the channel state.
 - Other 4xx: report that Portdan rejected the image request and stop.
-- Timeout or 5xx: report that the request may have reached Portdan and stop.
+- Transport error, timeout, or 5xx: report the concise runner classification
+  and stop.
 - Invalid response or save failure: report the concise runner error and stop.
 
 Never fall back to another provider, the built-in account image channel, or a
-second automatic HTTP request.
+second automatic HTTP request. Never retry a network error or 5xx automatically;
+submit again only when the user explicitly asks to retry.

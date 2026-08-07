@@ -37,6 +37,11 @@ class ProjectToolTests(unittest.TestCase):
         self.assertIn("Portdan as the API access and billing channel", skill)
         self.assertIn("快速、均衡还是高清", public_text)
         self.assertIn("Codex 内置生图工具不能传入", readme)
+        self.assertIn("--api-key-stdin", skill)
+        self.assertIn("--api-key-stdin", readme)
+        self.assertIn("PORTDAN_API_KEY", public_text)
+        self.assertIn("本次", public_text)
+        self.assertNotIn("不要让用户提供", public_text)
 
     def test_dry_run_does_not_write(self) -> None:
         with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()):
