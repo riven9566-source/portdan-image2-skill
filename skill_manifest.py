@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from pathlib import Path
 
 
 SKILL_NAME = "portdan-image2"
+SKILL_VERSION = "0.2.0"
 SKILL_FILES = (
     Path("LICENSE"),
     Path("SKILL.md"),
@@ -16,6 +18,14 @@ SKILL_FILES = (
 )
 
 MAX_SKILL_FILE_BYTES = 512 * 1024
+_VERSION_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+
+def validate_skill_version(version: str) -> str:
+    """Return a normalized release version or reject an unsafe filename value."""
+    if not _VERSION_PATTERN.fullmatch(version):
+        raise RuntimeError("Skill version must use MAJOR.MINOR.PATCH")
+    return version
 
 
 def _is_link_like(info: os.stat_result) -> bool:

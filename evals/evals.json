@@ -1,0 +1,81 @@
+{
+  "skill_name": "portdan-image2",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "使用 $portdan-image2 生成图片：清晨窗台上的灰色猫咪正在看雨。我没有指定任何 API 参数。只说明你会怎样调用和解读结果，不要真的联网。",
+      "expected_output": "使用 canonical JSON stdin 调用；请求语义只有原始 prompt，不追问或补默认字段；由于输入没有 n，普通结果中的 requested 和 diagnostics 都是 null。",
+      "files": [],
+      "expectations": [
+        "只准备一次 `--request-json-stdin --json` runner 调用，请求的生成语义只包含用户原始 prompt",
+        "runner 仅覆盖 transport 字段 `stream=true` 与 `response_format=b64_json`，不添加 model、size、n、quality 或 output_format",
+        "不追问画质，不自动追加 no readable text、no logo、no watermark 或其他创意限制",
+        "说明没有输入 n 时结果为 `requested=null`，普通 completed、partial、error 结果均为 `diagnostics=null`"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "使用 $portdan-image2 模拟一个请求，不要联网。请求字段是 model=\"gpt-image-future-preview\"、n=100、partial_images=true、quality=null，并加入 future_render_mode={\"modes\":[\"draft\",null],\"weights\":[0.25,1],\"flags\":{\"safe\":true}}。",
+      "expected_output": "把未来 GPT Images 模型名、n=100、partial_images、null、数组和未知嵌套字段按原 JSON 类型放进同一个请求，不限制 n、不拆请求；仅覆盖两个 transport 字段。",
+      "files": [],
+      "expectations": [
+        "同一个 JSON 请求保留 `model=gpt-image-future-preview`、`n=100`、`partial_images=true` 和 `quality=null`",
+        "完整保留 future_render_mode 中的数组、null、小数、整数、布尔与嵌套对象，不要求 Skill 预先认识未来字段",
+        "不因 n=100 而拒绝、截断、预分配 100 个结果、循环或拆成多个 runner/HTTP 请求；结果中的 `requested=100`",
+        "接受未来的 `gpt-image-...` 家族名称，但不切换到 Grok、edits 或内置生图通道",
+        "仅由 runner 覆盖 `stream=true` 与 `response_format=b64_json`，其他字段语义不改写"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "使用 $portdan-image2 生成图片，但没有找到可用的 Portdan Key。我本机 provider URL 可能写成 https://portdan.com、https://portdan.com/v1 或 https://portdan.com/v1/images/generations。请说明识别规则和安全下一步，不要联网。",
+      "expected_output": "说明三种正常 Portdan provider URL 形式都会自动识别；缺 Key 时在 POST 前停止，优先建议本机配置 PORTDAN_API_KEY，不索要或泄露聊天中的 Key。",
+      "files": [],
+      "expectations": [
+        "明确自动识别 Portdan root、`/v1` 和完整 `/v1/images/generations` provider URL，并允许结尾斜杠",
+        "说明本次在 POST 前停止、没有发送图片请求，因此这个失败尝试本身不会产生图片费用",
+        "优先建议在启动 Codex 的本机环境配置 PORTDAN_API_KEY 并重启 Codex",
+        "默认不要求用户把 Key 粘贴到聊天，也不把 Key 放入命令参数、请求 JSON、日志或临时文件",
+        "不回退到 Codex 内置账号、Grok 或其他 provider"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "刚才的 $portdan-image2 canonical 任务已经运行超过旧的 900 秒，返回了 session ID，并持续输出心跳；真实网络数据的间隔始终少于 1800 秒，我没有显式传 --timeout。继续处理。",
+      "expected_output": "canonical 默认没有 overall deadline，因此继续等待同一个 process/session；区分本地心跳和真实网络数据，不启动第二个 runner 或请求。",
+      "files": [],
+      "expectations": [
+        "恢复或等待原来的 session/process ID，而不是启动新进程",
+        "明确 canonical 默认无 overall deadline；超过旧 900 秒不是重启或失败理由",
+        "network idle 默认 1800 秒，只有真实网络字节重置 idle；本地心跳不会重置",
+        "不启动第二个 runner、不轮询其他 endpoint、不切换 provider、不自动重试 HTTP POST"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "一次 $portdan-image2 的终态 JSON 是 status=partial、requested=null、completed=2、diagnostics=null；artifacts 中有一个实际 PNG magic 的 .png 文件和一个未知 magic 的 .bin 文件。请展示结果并告诉我是否会自动补齐。",
+      "expected_output": "返回两个已有 artifacts，只报告 completed=2 而不编造分母；未知 magic 保持 .bin；说明潜在计费和不自动补发，也不把 model 字段当作上游证明。",
+      "files": [],
+      "expectations": [
+        "展示或返回 JSON artifacts 中全部两个绝对路径，并在 requested=null 时只报告 `completed=2`，不写 `2/?` 或推测总数",
+        "说明扩展名只看实际字节 magic；未知字节保持 `.bin`，不按请求 output_format 或 metadata 改名",
+        "保持普通 partial 结果的 `diagnostics=null`，不把 partial 描述成 completed",
+        "说明已完成图片可能已经计费，不伪造缺失路径，也不自动补发",
+        "不把显式 model 或 Portdan 返回结果描述成客户端已经独立证明了具体上游实现"
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "先使用 $portdan-image2 诊断这台机器的本机配置。允许只读定位安全的 Key 来源标签，但不要显示 Key，不要联网、生成图片、创建输出目录或修改文件。",
+      "expected_output": "只运行本机 `--diagnose --json`，返回固定 schema 和 diagnostics 三字段对象；允许只读发现安全来源 code，但不输出 Key、不联网、不创建目录，也不夸大为外部可用性证明。",
+      "files": [],
+      "expectations": [
+        "只准备或运行一次 `--diagnose --json`，不构造或发送图片请求",
+        "返回 `status=diagnose`、`error=null`、`request_id=null`、`requested=null`、`completed=0`、`artifacts=[]`",
+        "`diagnostics` 恰好包含 `endpoint`、`key_source`、`output_directory`；output_directory 是绝对预期路径但不会被创建",
+        "可以只读检查正常本机配置以定位安全来源 code，但绝不输出 Key 值，也不修改配置或创建文件",
+        "明确诊断不联网，不能证明余额、权限、内容政策、限流余量、代理、DNS/TLS、Portdan 或上游健康"
+      ]
+    }
+  ]
+}
