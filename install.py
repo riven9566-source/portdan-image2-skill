@@ -12,7 +12,13 @@ import stat
 import tempfile
 from pathlib import Path
 
-from skill_manifest import SKILL_FILES, SKILL_NAME, _is_link_like, read_regular_file
+from skill_manifest import (
+    SKILL_FILES,
+    SKILL_NAME,
+    SKILL_VERSION,
+    _is_link_like,
+    read_regular_file,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +49,14 @@ def _existing_real_directory(path: Path) -> Path:
 
 def default_codex_home() -> Path:
     home = Path.home()
+    configured = os.environ.get("CODEX_HOME")
+    if configured is not None:
+        if not configured.strip():
+            raise RuntimeError("CODEX_HOME is empty")
+        target = Path(configured.strip()).expanduser()
+        if not target.is_absolute():
+            raise RuntimeError("CODEX_HOME must be absolute")
+        return target
     settings = home / ".cc-switch" / "settings.json"
     if settings.exists() or settings.is_symlink():
         custom = _read_settings(settings).get("codexConfigDir")
@@ -86,7 +100,7 @@ def _write_staging_file(path: Path, data: bytes) -> None:
             os.close(descriptor)
 
 
-def install(target: Path, force: bool, dry_run: bool) -> Path:
+def install(target: Path, force: bool, dry_run: bool, upgrade: bool = False) -> Path:
     files = approved_sources()
     target = target.expanduser().resolve()
     if target == Path(target.anchor):
@@ -97,12 +111,19 @@ def install(target: Path, force: bool, dry_run: bool) -> Path:
     destination = skills / SKILL_NAME
     if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
         raise RuntimeError("Skill destination is invalid")
+    if upgrade and not destination.exists():
+        raise RuntimeError("Skill is not installed; omit --upgrade for the first installation")
     if dry_run:
-        print("Would install {} files to {}".format(len(files), destination))
+        action = "upgrade" if upgrade else "install"
+        print(
+            "Would {} {} {} ({} files) at {}".format(
+                action, SKILL_NAME, SKILL_VERSION, len(files), destination
+            )
+        )
         return destination
     skills.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and not force:
-        raise RuntimeError("destination already exists; use --force to replace this Skill")
+    if destination.exists() and not (force or upgrade):
+        raise RuntimeError("destination already exists; use --upgrade to update this Skill")
     staging_parent = Path(tempfile.mkdtemp(prefix=SKILL_NAME + "-", dir=str(skills)))
     staging = staging_parent / SKILL_NAME
     backup = destination.with_name(destination.name + ".backup-" + secrets.token_hex(6))
@@ -123,19 +144,38 @@ def install(target: Path, force: bool, dry_run: bool) -> Path:
             shutil.rmtree(backup)
     finally:
         shutil.rmtree(staging_parent, ignore_errors=True)
-    print("Installed {} to {}".format(SKILL_NAME, destination))
+    action = "Upgraded" if upgrade else "Installed"
+    print("{} {} {} at {}".format(action, SKILL_NAME, SKILL_VERSION, destination))
     print("Restart Codex, then use $portdan-image2.")
     return destination
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install Portdan Image2")
+    parser.add_argument(
+        "--version", action="version", version="{} {}".format(SKILL_NAME, SKILL_VERSION)
+    )
     parser.add_argument("--codex-home", type=Path, default=None)
-    parser.add_argument("--force", action="store_true")
+    replacement = parser.add_mutually_exclusive_group()
+    replacement.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="replace an existing installation with this source version",
+    )
+    replacement.add_argument(
+        "--force",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
-        install(args.codex_home or default_codex_home(), args.force, args.dry_run)
+        install(
+            args.codex_home or default_codex_home(),
+            args.force,
+            args.dry_run,
+            upgrade=args.upgrade,
+        )
         return 0
     except (OSError, RuntimeError) as exc:
         print("Install error: {}".format(exc))

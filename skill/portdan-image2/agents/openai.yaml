@@ -1,7 +1,7 @@
 interface:
   display_name: "Portdan Image2"
-  short_description: "通过 Portdan Responses 调用 OpenAI gpt-image-2"
-  default_prompt: "使用 $portdan-image2 生成一张图片；如果我没指定画质，只问我选择快速、均衡或高清。"
+  short_description: "使用自有 Key 通过 Portdan GPT 图片生成接口生成图片"
+  default_prompt: "使用 $portdan-image2 通过 Portdan 按我的描述生成图片，只透传我明确指定的 API 参数。"
 
 policy:
   allow_implicit_invocation: true

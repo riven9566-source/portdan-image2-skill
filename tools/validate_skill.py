@@ -10,7 +10,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from skill_manifest import SKILL_FILES, SKILL_NAME, _is_link_like, read_regular_file
+from skill_manifest import (
+    SKILL_FILES,
+    SKILL_NAME,
+    SKILL_VERSION,
+    _is_link_like,
+    read_regular_file,
+    validate_skill_version,
+)
 SKILL_ROOT = ROOT / "skill" / SKILL_NAME
 
 
@@ -20,6 +27,7 @@ def _is_python_cache(path: Path) -> bool:
 
 
 def main() -> int:
+    validate_skill_version(SKILL_VERSION)
     if not SKILL_ROOT.is_dir() or SKILL_ROOT.is_symlink():
         raise RuntimeError("Skill directory is invalid")
     expected = {str(path).replace("\\", "/") for path in SKILL_FILES}
@@ -42,6 +50,11 @@ def main() -> int:
         raise RuntimeError("SKILL.md description is missing")
     if (SKILL_ROOT / "LICENSE").read_bytes() != (ROOT / "LICENSE").read_bytes():
         raise RuntimeError("Skill LICENSE must match the repository LICENSE")
+    legacy_artifact = ROOT / "dist" / (SKILL_NAME + ".skill")
+    if legacy_artifact.exists() or legacy_artifact.is_symlink():
+        raise RuntimeError(
+            "remove the unversioned dist archive; release packages must be rebuilt from source"
+        )
     print("Skill validation OK: {}".format(SKILL_ROOT))
     return 0
 

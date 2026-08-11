@@ -1,0 +1,74 @@
+name: Release Skill
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tagged commit belongs to main
+        shell: bash
+        run: |
+          tagged_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          checked_out_commit="$(git rev-parse HEAD)"
+          git show-ref --verify --quiet refs/remotes/origin/main
+          if [[ "${checked_out_commit}" != "${tagged_commit}" ]]; then
+            echo "Checked-out commit does not match GITHUB_SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${tagged_commit}" refs/remotes/origin/main; then
+            echo "Tagged commit is not contained in origin/main" >&2
+            exit 1
+          fi
+
+      - name: Use Python 3.9
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+
+      - name: Verify the tag matches the source version
+        shell: bash
+        run: |
+          source_version="$(python -c 'import skill_manifest; print(skill_manifest.SKILL_VERSION)')"
+          if [[ "${GITHUB_REF_NAME}" != "v${source_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match source version ${source_version}" >&2
+            exit 1
+          fi
+          echo "SOURCE_VERSION=${source_version}" >> "${GITHUB_ENV}"
+
+      - name: Test and validate the source
+        run: |
+          python -m unittest discover -s tests -v
+          python tools/validate_skill.py
+          python -m py_compile install.py package_skill.py skill_manifest.py tools/validate_skill.py skill/portdan-image2/scripts/generate_image.py
+
+      - name: Build and verify release artifacts
+        run: |
+          python package_skill.py --output-dir release --release-version "${SOURCE_VERSION}"
+          cd release
+          sha256sum --check "portdan-image2-${SOURCE_VERSION}.skill.sha256"
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "release/portdan-image2-${SOURCE_VERSION}.skill" \
+            "release/portdan-image2-${SOURCE_VERSION}.skill.sha256" \
+            --verify-tag \
+            --title "Portdan Image2 ${SOURCE_VERSION}" \
+            --generate-notes
